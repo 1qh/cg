@@ -3,6 +3,7 @@
 // Gemini-safe defaults live here so product code never re-derives them.
 import { Codex } from "@openai/codex-sdk";
 import type { ThreadItem, ThreadEvent, ThreadOptions } from "@openai/codex-sdk";
+import { runResilient, type ResilienceOptions } from "./resilience.ts";
 
 /** Bridge connection. Every field required — a missing value throws at construction, never defaults. */
 export interface BridgeConfig {
@@ -73,6 +74,15 @@ export class CodexRuntime {
       async run(input: string): Promise<TurnResult> {
         const turn = await thread.run(input);
         return { items: turn.items, finalResponse: turn.finalResponse, usage: turn.usage, threadId: thread.id ?? null };
+      },
+      // Turn execution under the resilience policy: a turn that throws (throttle / transport failure) is
+      // retried with deadline + exponential backoff. This is the product path — turn-completion degrades
+      // under burst, so the agent retries rather than surfacing a failure.
+      async runResilient(input: string, opts?: ResilienceOptions): Promise<TurnResult> {
+        return runResilient(async () => {
+          const turn = await thread.run(input);
+          return { items: turn.items, finalResponse: turn.finalResponse, usage: turn.usage, threadId: thread.id ?? null };
+        }, opts);
       },
       async *stream(input: string): AsyncGenerator<ThreadEvent> {
         const { events } = await thread.runStreamed(input);
