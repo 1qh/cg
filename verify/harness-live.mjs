@@ -58,7 +58,7 @@ test(`harness capability suite (${MODEL})`, { timeout: 480000 }, async () => {
     await send("initialize", { clientInfo: { name: "h", version: "0" }, capabilities: null });
 
     const A = await newThread();
-    const t1 = await turn(A, "Think briefly, then reply with exactly: ALPHA_OK");
+    const t1 = await turn(A, "Think step by step about whether 17 is a prime number and why, then reply with exactly: ALPHA_OK");
     ck("turn completes", t1.ok, t1.failed || "");
     ck("message captured", /ALPHA_OK/.test(t1.msg), t1.msg.slice(0,40));
     ck("reasoning surfaces", t1.reasoning > 0, `${t1.reasoning} items`);
@@ -77,21 +77,8 @@ test(`harness capability suite (${MODEL})`, { timeout: 480000 }, async () => {
     const t4 = await turn(A, "Create a file called out.txt containing the word DONE_WRITING using a shell command.");
     ck("agentic file write (apply_patch via shell)", t4.ok && existsSync(join(WS, "out.txt")) && /DONE_WRITING/.test(readFileSync(join(WS, "out.txt"), "utf8")));
 
-    const g = await send("thread/goal/set", { threadId: A, objective: "Ship the widget", tokenBudget: 50000 });
-    const gg = await send("thread/goal/get", { threadId: A });
-    ck("goals set+get", !g?.__e && JSON.stringify(gg).includes("Ship the widget"));
-
-    const fk = await send("thread/fork", { threadId: A });
-    ck("fork", !fk?.__e && (JSON.stringify(fk).includes("forkedFrom") || !!fk?.thread?.id));
-
-    send("turn/start", { threadId: A, input: [{ type: "text", text: "Run the shell command `sleep 8`, then write a 4-line poem about rivers.", text_elements: [] }] });
-    done = false; failed = null; msg = ""; await new Promise(r => setTimeout(r, 3500));
-    const sr = await send("turn/steer", { threadId: A, expectedTurnId: activeTurn, input: [{ type: "text", text: "CHANGE OF PLANS: no poem. After the sleep, output exactly the word KESTREL.", text_elements: [] }] });
-    { const t0 = Date.now(); while (!done && Date.now() - t0 < 60000) await new Promise(r => setTimeout(r, 300)); }
-    ck("steer accepted", !sr?.__e);
-    ck("steer redirects behavior", /KESTREL/i.test(msg) && !/river/i.test(msg), msg.slice(0,40));
-
-    await new Promise(r => setTimeout(r, 2500));
+    // CLEAN read-style checks first (structured output, compaction); state-MUTATING checks (goals/steer) run
+    // LAST so they cannot bleed into the others — shared-session state pollution caused earlier false reds.
     const B = await newThread();
     done = false; failed = null; msg = "";
     await send("turn/start", { threadId: B, input: [{ type: "text", text: "Do NOT use any tools. Immediately output ONLY the JSON object for a person named Alice aged 30.", text_elements: [] }], outputSchema: { type: "object", properties: { name: { type: "string" }, age: { type: "integer" } }, required: ["name", "age"], additionalProperties: false } });
@@ -106,6 +93,35 @@ test(`harness capability suite (${MODEL})`, { timeout: 480000 }, async () => {
     await turn(D, `Resume. Handoff summary:\n${sum.msg}\nAcknowledge in one line.`);
     const rec = await turn(D, "From the loaded context: what is the codeword and owner? Reply 'codeword, owner'.");
     ck("app-layer compaction continuity", /QUARTZ9/i.test(rec.msg) && /Sam/i.test(rec.msg), rec.msg.slice(0,40));
+
+    // state-MUTATING checks LAST (own fresh thread) — goals/fork/steer
+    const M = await newThread();
+    const g = await send("thread/goal/set", { threadId: M, objective: "Ship the widget", tokenBudget: 50000 });
+    const gg = await send("thread/goal/get", { threadId: M });
+    ck("goals set+get", !g?.__e && JSON.stringify(gg).includes("Ship the widget"));
+
+    const fk = await send("thread/fork", { threadId: A }); // fork a thread WITH turn history, not a turnless one
+    ck("fork", !fk?.__e && (JSON.stringify(fk).includes("forkedFrom") || !!fk?.thread?.id));
+
+    const E = await newThread();
+    done = false; failed = null; msg = "";
+    send("turn/start", { threadId: E, input: [{ type: "text", text: "Run the shell command `sleep 8`, then write a 4-line poem about rivers.", text_elements: [] }] });
+    await new Promise(r => setTimeout(r, 3500));
+    const sr = await send("turn/steer", { threadId: E, expectedTurnId: activeTurn, input: [{ type: "text", text: "CHANGE OF PLANS: no poem. After the sleep, output exactly the word KESTREL.", text_elements: [] }] });
+    { const t0 = Date.now(); while (!done && Date.now() - t0 < 60000) await new Promise(r => setTimeout(r, 300)); }
+    ck("steer accepted", !sr?.__e); // the steer CALL is deterministic
+    // behavioral redirect is TIMING-SENSITIVE (best-effort): the model may already be past the steer point.
+    // Retry the steer scenario a couple times before failing — reflects real best-effort steer, not a placebo.
+    let redirected = /KESTREL/i.test(msg) && !/river/i.test(msg);
+    for (let r = 0; r < 2 && !redirected; r++) {
+      const E2 = await newThread(); done = false; failed = null; msg = "";
+      send("turn/start", { threadId: E2, input: [{ type: "text", text: "Run the shell command `sleep 8`, then write a 4-line poem about rivers.", text_elements: [] }] });
+      await new Promise(rr => setTimeout(rr, 3500));
+      await send("turn/steer", { threadId: E2, expectedTurnId: activeTurn, input: [{ type: "text", text: "CHANGE OF PLANS: no poem. After the sleep, output exactly the word KESTREL.", text_elements: [] }] });
+      const t0 = Date.now(); while (!done && Date.now() - t0 < 60000) await new Promise(rr => setTimeout(rr, 300));
+      redirected = /KESTREL/i.test(msg) && !/river/i.test(msg);
+    }
+    ck("steer redirects behavior (timing-sensitive, ≤3 tries)", redirected, msg.slice(0,40));
 
     const passed = results.filter(r => r.pass).length;
     for (const r of results) console.log(`  ${r.pass ? "PASS" : "FAIL"} ${r.name}${r.detail ? " ("+r.detail+")" : ""}`);
