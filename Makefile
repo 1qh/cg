@@ -1,3 +1,5 @@
+.PHONY: bridge-bootstrap bridge-run verify verify-live harness help
+
 ## bridge-bootstrap: create the proxy venv + install the pinned patched litellm
 bridge-bootstrap:
 	@scripts/bridge.sh bootstrap
