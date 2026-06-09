@@ -1,0 +1,12 @@
+model_list:
+  - model_name: gemini-3.5-flash
+    litellm_params:
+      model: gemini/gemini-3.5-flash
+      api_key: os.environ/GEMINI_API_KEY
+      # Gemini 3.5 demands this when function-calling tools are present.
+      include_server_side_tool_invocations: true
+      tool_config:
+        include_server_side_tool_invocations: true
+
+litellm_settings:
+  drop_params: true
