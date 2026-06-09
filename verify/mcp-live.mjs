@@ -45,6 +45,8 @@ test(`MCP tool call through the harness (${MODEL})`, { timeout: 180000 }, async 
       if (m.id != null && m.method) { srv.stdin.write(JSON.stringify({ id: m.id, result: {} }) + "\n"); continue }
       const it = m.params?.item; const t = it?.type || "";
       if (/mcp/i.test(t)) { sawMcp = true; if (/42/.test(JSON.stringify(it))) mcpResult += "42"; }
+      if (t === "agent_message") mcpResult += " MSG:" + (it.text || "");
+      if (m.method === "item/agentMessage/delta") mcpResult += (m.params?.delta || "");
       if (m.method === "turn/completed") done = true; if (m.method === "turn/failed") { failed = JSON.stringify(m.params).slice(0,100); done = true } } });
 
     await send("initialize", { clientInfo: { name: "mcp", version: "0" }, capabilities: null });
@@ -57,11 +59,14 @@ test(`MCP tool call through the harness (${MODEL})`, { timeout: 180000 }, async 
     const direct = await send("mcpServer/tool/call", { threadId, server: "verifytools", tool: "get_secret_number", arguments: {} });
     assert.match(JSON.stringify(direct), /42/, "codex must reach the MCP server and get its result (direct tool/call)");
 
-    await send("turn/start", { threadId, input: [{ type: "text", text: "Call the get_secret_number MCP tool and report the secret number.", text_elements: [] }] });
+    // result-DEPENDENT prompt: the answer (84) is only reachable if the model actually USES the tool result (42).
+    mcpResult = "";
+    await send("turn/start", { threadId, input: [{ type: "text", text: "Call the get_secret_number tool to get the secret number, then multiply it by 2 and reply with ONLY the final number.", text_elements: [] }] });
     const t0 = Date.now(); while (!done && Date.now() - t0 < 90000) await new Promise(r => setTimeout(r, 400));
-    console.log(`  ${MODEL}: server loaded ✓ | direct call=42 ✓ | model mcp_item=${sawMcp} resultSeen=${mcpResult.includes("42")}`);
+    console.log(`  ${MODEL}: server loaded ✓ | direct call=42 ✓ | model mcp_item=${sawMcp} | usesResult(84)=${/\b84\b/.test(mcpResult)}`);
     assert.ok(!failed, `MCP turn failed: ${failed}`);
     assert.ok(sawMcp, "a model turn must surface an MCP item (the tool is offered to the model)");
+    assert.match(mcpResult, /\b84\b/, "the model must USE the MCP tool's result (42*2=84), not just call the tool");
   } finally {
     srv?.kill("SIGKILL");
     bridge.kill("SIGKILL");
