@@ -71,8 +71,8 @@ export class CodexRuntime {
     const thread = this.#codex.startThread(threadOpts);
     return {
       get id(): string | null { return thread.id ?? null; },
-      async run(input: string): Promise<TurnResult> {
-        const turn = await thread.run(input);
+      async run(input: string, opts?: { readonly outputSchema?: unknown }): Promise<TurnResult> {
+        const turn = await thread.run(input, opts?.outputSchema ? { outputSchema: opts.outputSchema } : undefined);
         return { items: turn.items, finalResponse: turn.finalResponse, usage: turn.usage, threadId: thread.id ?? null };
       },
       // Turn execution under the resilience policy: a turn that throws (throttle / transport failure) is

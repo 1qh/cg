@@ -46,6 +46,17 @@ test("LIVE: façade edits a file on the BYOK model via the bridge", { timeout: 1
     const after = readFileSync(join(wd, "math.py"), "utf8");
     console.log("  thread:", session.id, "| finalResponse:", turn.finalResponse.slice(0, 60));
     assert.match(after, /def multiply\(a, b\)/, "façade must have driven the model to add multiply() to the file");
+
+    // façade surface beyond run(): multi-turn continuity (same session) + structured output (via the façade)
+    await session.run("Remember the number 24601.");
+    const recall = await session.run("What number did I ask you to remember? Reply with only the digits.");
+    assert.match(recall.finalResponse, /24601/, "façade multi-turn continuity (same session) must carry memory");
+
+    const sess2 = rt.startSession({ workingDirectory: wd, approvalPolicy: "never" });
+    const so = await sess2.run("Do NOT use any tools. Output ONLY the JSON object for a person named Alice aged 30.", { outputSchema: { type: "object", properties: { name: { type: "string" }, age: { type: "integer" } }, required: ["name", "age"], additionalProperties: false } });
+    let sj = null; try { sj = JSON.parse(so.finalResponse.match(/\{[\s\S]*\}/)?.[0] || "null") } catch {}
+    console.log("  façade structured output:", JSON.stringify(sj));
+    assert.ok(sj && sj.name && typeof sj.age === "number", "façade outputSchema must produce a valid typed object");
   } finally {
     bridge.kill("SIGKILL");
   }
