@@ -8,7 +8,8 @@
     "exactOptionalPropertyTypes": true,
     "skipLibCheck": true,
     "verbatimModuleSyntax": true,
-    "outDir": "dist"
+    "allowImportingTsExtensions": true,
+    "noEmit": true
   },
   "include": ["src", "verify"]
 }
