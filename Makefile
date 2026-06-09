@@ -14,7 +14,7 @@ verify:
 
 ## verify-live: live capability suite on the real Gemini path (needs GEMINI_API_KEY)
 verify-live:
-	@node --test verify/harness-live.mjs verify/harness-advanced-live.mjs verify/harness-final-live.mjs verify/image-input-live.mjs verify/parity-live.mjs verify/runtime-live.mjs verify/compaction-live.mjs
+	@node --test verify/harness-live.mjs verify/harness-advanced-live.mjs verify/harness-final-live.mjs verify/mcp-live.mjs verify/image-input-live.mjs verify/parity-live.mjs verify/runtime-live.mjs verify/compaction-live.mjs
 
 ## harness: comprehensive harness capability suite on the real path (PARITY_MODEL overrides tier)
 harness:
