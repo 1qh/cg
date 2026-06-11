@@ -33,12 +33,12 @@ export class AppServerSession {
     for (const k of ["baseUrl", "apiKey", "model"] as const) if (!cfg[k]) throw new Error(`BridgeConfig.${k} required`);
     if (!opts.workingDirectory || !opts.modelCatalogPath) throw new Error("workingDirectory + modelCatalogPath required");
     this.#model = cfg.model;
-    const c = ["-c","model_provider=litellm","-c",'model_providers.litellm.name="g"',
-      "-c",`model_providers.litellm.base_url="${cfg.baseUrl}"`,"-c",'model_providers.litellm.wire_api="responses"',
-      "-c",'model_providers.litellm.env_key="LITELLM_KEY"',"-c",`model_reasoning_effort="${opts.reasoningEffort ?? "high"}"`,
+    const c = ["-c","model_provider=gemini","-c",'model_providers.gemini.name="g"',
+      "-c",`model_providers.gemini.base_url="${cfg.baseUrl}"`,"-c",'model_providers.gemini.wire_api="responses"',
+      "-c",'model_providers.gemini.env_key="BRIDGE_KEY"',"-c",`model_reasoning_effort="${opts.reasoningEffort ?? "high"}"`,
       ...(opts.reasoningSummary ? ["-c",`model_reasoning_summary="${opts.reasoningSummary}"`] : []),
       "-c",`model_catalog_json="${opts.modelCatalogPath}"`];
-    this.#proc = spawn("codex", ["app-server", ...c], { env: { ...process.env, LITELLM_KEY: cfg.apiKey }, stdio: ["pipe", "pipe", "ignore"] });
+    this.#proc = spawn("codex", ["app-server", ...c], { env: { ...process.env, BRIDGE_KEY: cfg.apiKey }, stdio: ["pipe", "pipe", "ignore"] });
     this.#proc.stdout!.on("data", (chunk: Buffer) => this.#onData(chunk));
   }
 
@@ -74,7 +74,7 @@ export class AppServerSession {
 
   async start(opts: AppServerSessionOptions): Promise<void> {
     await this.#send("initialize", { clientInfo: { name: "codex-byok", version: "0" }, capabilities: null });
-    const ts = await this.#send("thread/start", { model: this.#model, modelProvider: "litellm", cwd: opts.workingDirectory, approvalPolicy: opts.approvalPolicy ?? "on-request", sandbox: opts.sandboxMode ?? "workspace-write" }) as Record<string, unknown>;
+    const ts = await this.#send("thread/start", { model: this.#model, modelProvider: "gemini", cwd: opts.workingDirectory, approvalPolicy: opts.approvalPolicy ?? "on-request", sandbox: opts.sandboxMode ?? "workspace-write" }) as Record<string, unknown>;
     this.#threadId = (ts?.["thread"] as Record<string, unknown>)?.["id"] as string ?? (ts?.["threadId"] as string) ?? null;
     if (!this.#threadId) throw new Error("thread/start did not return a thread id");
   }

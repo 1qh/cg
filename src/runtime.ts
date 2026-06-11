@@ -7,7 +7,7 @@ import { runResilient, type ResilienceOptions } from "./resilience.ts";
 
 /** Bridge connection. Every field required — a missing value throws at construction, never defaults. */
 export interface BridgeConfig {
-  /** Base URL of the patched LiteLLM responses bridge, e.g. http://localhost:4011/v1 */
+  /** Base URL of the pure-Rust responses bridge, e.g. http://localhost:4011/v1 */
   readonly baseUrl: string;
   /** Master key the bridge expects. */
   readonly apiKey: string;
@@ -47,12 +47,12 @@ export class CodexRuntime {
     this.#model = cfg.model;
     this.#codex = new Codex({
       config: {
-        model_provider: "litellm",
+        model_provider: "gemini",
         model_providers: {
-          litellm: { name: "BYOK via LiteLLM", base_url: cfg.baseUrl, wire_api: "responses", env_key: "LITELLM_KEY" },
+          gemini: { name: "BYOK via pure-Rust bridge", base_url: cfg.baseUrl, wire_api: "responses", env_key: "BRIDGE_KEY" },
         },
       },
-      env: { ...process.env, LITELLM_KEY: cfg.apiKey } as Record<string, string>,
+      env: { ...process.env, BRIDGE_KEY: cfg.apiKey } as Record<string, string>,
     });
   }
 
