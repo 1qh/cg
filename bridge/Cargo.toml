@@ -1,0 +1,25 @@
+[package]
+name = "codex-gemini-bridge"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Pure-Rust /v1/responses server translating codex's responses API to Gemini"
+
+[[bin]]
+name = "codex-gemini-bridge"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+reqwest = { version = "0.13", features = ["json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures-util = "0.3"
+futures = "0.3"
+uuid = { version = "1", features = ["v4"] }
+clap = { version = "4", features = ["derive"] }
+async-openai = { version = "0.41", default-features = false, features = ["response-types"] }
+gemini-rust = { path = "vendor/gemini-rust" }
