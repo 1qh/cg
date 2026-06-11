@@ -22,4 +22,4 @@ futures = "0.3"
 uuid = { version = "1", features = ["v4"] }
 clap = { version = "4", features = ["derive"] }
 async-openai = { version = "0.41", default-features = false, features = ["response-types"] }
-gemini-rust = { path = "vendor/gemini-rust" }
+gemini-rust = { path = "vendor/gemini-rust", version = "1.7.1" }
