@@ -58,7 +58,7 @@ async fn main() {
     let api_key = std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY");
     let app = Router::new().route("/v1/responses", post(responses))
         .route("/health/liveliness", get(|| async { "ok" })).with_state(AppState { api_key });
-    let port = std::env::var("PORT").unwrap_or_else(|_| "4054".into());
+    let port = std::env::var("PORT").expect("PORT env required (no fallback)");
     let l = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await.unwrap();
     eprintln!("typed bridge on :{port}");
     axum::serve(l, app).await.unwrap();
