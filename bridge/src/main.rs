@@ -107,7 +107,12 @@ async fn responses(State(st): State<AppState>, Json(req): Json<CodexReq>) -> Sse
         san(&mut p);
         b = b.with_tool(GTool::new(FunctionDeclaration::new(&t.name, &t.description, None).with_parameters_value(p)));
     }
-    if has_tools { b = b.with_tool_config(ToolConfig { ..Default::default() }); }
+    // grounding injection: built-in web/url tools on every request (model grounds selectively);
+    // includeServerSideToolInvocations unlocks the union (built-in + function tools coexisting).
+    let _ = has_tools;
+    b = b.with_tool(GTool::google_search());
+    b = b.with_tool(GTool::url_context());
+    b = b.with_tool_config(ToolConfig { include_server_side_tool_invocations: Some(true), ..Default::default() });
     let mut tc = ThinkingConfig::new().with_thoughts_included(true);
     if let Some(r) = &req.reasoning { if let Some(e) = r.effort {
         let lvl = match e { CodexEffort::Minimal=>ThinkingLevel::Minimal, CodexEffort::Low=>ThinkingLevel::Low, CodexEffort::Medium=>ThinkingLevel::Medium, CodexEffort::High|CodexEffort::Xhigh=>ThinkingLevel::High };
