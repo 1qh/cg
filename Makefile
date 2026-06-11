@@ -1,10 +1,10 @@
 .PHONY: bridge-bootstrap bridge-run verify verify-live harness help
 
-## bridge-bootstrap: create the proxy venv + install the pinned patched litellm
+## bridge-bootstrap: build the pure-Rust bridge binary (cargo release)
 bridge-bootstrap:
 	@scripts/bridge.sh bootstrap
 
-## bridge-run: launch the patched responses bridge (STRICT self-check; PORT=4011)
+## bridge-run: launch the pure-Rust responses bridge (PORT=4011)
 bridge-run:
 	@scripts/bridge.sh run
 
