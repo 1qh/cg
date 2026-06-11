@@ -33,7 +33,7 @@ open(sys.argv[1],'wb').write(png)
 function startBridge() {
   const fd = openSync("/tmp/image-input-bridge.log", "w");
   return spawn("scripts/bridge.sh", ["run", String(PORT)], {
-    cwd: ROOT, env: { ...process.env, LITELLM_MASTER_KEY: "sk-spike-local", LITELLM_PATCH_STRICT: "1" }, stdio: ["ignore", fd, fd] });
+    cwd: ROOT, env: { ...process.env }, stdio: ["ignore", fd, fd] });
 }
 async function health(ms){const e=Date.now()+ms;while(Date.now()<e){try{if((await fetch(`http://localhost:${PORT}/health/liveliness`,{signal:AbortSignal.timeout(1500)})).ok)return true}catch{}await new Promise(r=>setTimeout(r,500))}return false}
 
@@ -47,10 +47,10 @@ test(`image input (multimodal) through the harness (${MODEL})`, { timeout: 18000
     redPng(img);
     const out = await new Promise((resolve) => {
       const p = spawn("codex", ["exec", "--image", img, "--skip-git-repo-check", "-C", wd,
-        "-c","model_provider=litellm","-c",'model_providers.litellm.name="g"',
-        "-c",`model_providers.litellm.base_url="http://localhost:${PORT}/v1"`,"-c",'model_providers.litellm.wire_api="responses"',
-        "-c",'model_providers.litellm.env_key="LITELLM_KEY"',"-c",`model="${MODEL}"`,"-c",`model_catalog_json="${CAT}"`],
-        { env: { ...process.env, LITELLM_KEY: "sk-spike-local" }, stdio: ["pipe","pipe","ignore"] });
+        "-c","model_provider=gemini","-c",'model_providers.gemini.name="g"',
+        "-c",`model_providers.gemini.base_url="http://localhost:${PORT}/v1"`,"-c",'model_providers.gemini.wire_api="responses"',
+        "-c",'model_providers.gemini.env_key="BRIDGE_KEY"',"-c",`model="${MODEL}"`,"-c",`model_catalog_json="${CAT}"`],
+        { env: { ...process.env, BRIDGE_KEY: "sk-spike-local" }, stdio: ["pipe","pipe","ignore"] });
       let o = ""; p.stdout.on("data", d => o += d);
       p.stdin.write("What is the dominant color of this image? Answer with ONLY the color name.\n"); p.stdin.end();
       const t = setTimeout(() => { p.kill("SIGKILL"); resolve(o); }, 120000);

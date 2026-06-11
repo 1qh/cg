@@ -10,11 +10,11 @@ bridge-run:
 
 ## verify: offline can-fail suite (no API spend) — bridge self-check + primitives
 verify:
-	@node --test verify/bridge-selfcheck.mjs verify/resilience.mjs verify/secret-store.mjs verify/store.mjs >/dev/null 2>&1 && echo ok || node --test verify/bridge-selfcheck.mjs verify/resilience.mjs verify/secret-store.mjs verify/store.mjs
+	@node --test verify/resilience.mjs verify/secret-store.mjs verify/store.mjs >/dev/null 2>&1 && echo ok || node --test verify/resilience.mjs verify/secret-store.mjs verify/store.mjs
 
 ## verify-live: live capability suite on the real Gemini path (needs GEMINI_API_KEY)
 verify-live:
-	@node --test verify/harness-live.mjs verify/harness-advanced-live.mjs verify/harness-final-live.mjs verify/app-server-session-live.mjs verify/burst-recovery-live.mjs verify/burst-sustained-live.mjs verify/patch-necessity-live.mjs verify/mcp-live.mjs verify/image-input-live.mjs verify/parity-live.mjs verify/runtime-live.mjs verify/compaction-live.mjs
+	@node --test verify/harness-live.mjs verify/harness-advanced-live.mjs verify/harness-final-live.mjs verify/app-server-session-live.mjs verify/burst-recovery-live.mjs verify/burst-sustained-live.mjs verify/mcp-live.mjs verify/image-input-live.mjs verify/parity-live.mjs verify/runtime-live.mjs verify/compaction-live.mjs
 
 ## harness: comprehensive harness capability suite on the real path (PARITY_MODEL overrides tier)
 harness:

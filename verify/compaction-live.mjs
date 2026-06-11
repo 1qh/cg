@@ -18,7 +18,7 @@ const MODEL = process.env.PARITY_MODEL || "gemini-3.5-flash";
 function startBridge() {
   const fd = openSync("/tmp/compaction-live-bridge.log", "w");
   return spawn("scripts/bridge.sh", ["run", String(PORT)], {
-    cwd: ROOT, env: { ...process.env, LITELLM_MASTER_KEY: "sk-spike-local", LITELLM_PATCH_STRICT: "1" },
+    cwd: ROOT, env: { ...process.env },
     stdio: ["ignore", fd, fd],
   });
 }

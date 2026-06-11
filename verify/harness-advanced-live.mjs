@@ -16,7 +16,7 @@ const CAT = join(ROOT, "bridge", "gemini-catalog.json");
 function startBridge() {
   const fd = openSync("/tmp/harness-adv-bridge.log", "w");
   return spawn("scripts/bridge.sh", ["run", String(PORT)], {
-    cwd: ROOT, env: { ...process.env, LITELLM_MASTER_KEY: "sk-spike-local", LITELLM_PATCH_STRICT: "1" }, stdio: ["ignore", fd, fd] });
+    cwd: ROOT, env: { ...process.env }, stdio: ["ignore", fd, fd] });
 }
 async function health(ms){const e=Date.now()+ms;while(Date.now()<e){try{if((await fetch(`http://localhost:${PORT}/health/liveliness`,{signal:AbortSignal.timeout(1500)})).ok)return true}catch{}await new Promise(r=>setTimeout(r,500))}return false}
 
@@ -31,10 +31,10 @@ test(`advanced harness: approval accept/decline, parallel tools, abort (${MODEL}
   let decisionMode = "accept", approvalAsked = false;
   try {
     assert.equal(await health(60000), true, "bridge must serve");
-    const cfg = ["-c","model_provider=litellm","-c",'model_providers.litellm.name="g"',
-      "-c",`model_providers.litellm.base_url="http://localhost:${PORT}/v1"`,"-c",'model_providers.litellm.wire_api="responses"',
-      "-c",'model_providers.litellm.env_key="LITELLM_KEY"',"-c",'model_reasoning_effort="high"',"-c",`model_catalog_json="${CAT}"`];
-    srv = spawn("codex", ["app-server", ...cfg], { env: { ...process.env, LITELLM_KEY: "sk-spike-local" }, stdio: ["pipe","pipe","ignore"] });
+    const cfg = ["-c","model_provider=gemini","-c",'model_providers.gemini.name="g"',
+      "-c",`model_providers.gemini.base_url="http://localhost:${PORT}/v1"`,"-c",'model_providers.gemini.wire_api="responses"',
+      "-c",'model_providers.gemini.env_key="BRIDGE_KEY"',"-c",'model_reasoning_effort="high"',"-c",`model_catalog_json="${CAT}"`];
+    srv = spawn("codex", ["app-server", ...cfg], { env: { ...process.env, BRIDGE_KEY: "sk-spike-local" }, stdio: ["pipe","pipe","ignore"] });
     let id = 1; const pend = new Map(); let buf = "", done = false, failed = null, shellItems = 0, parallelMax = 0, activeTurn = null;
     const send = (m, pa) => { const i = id++; srv.stdin.write(JSON.stringify({ method: m, id: i, params: pa }) + "\n"); return new Promise(r => pend.set(i, r)); };
     srv.stdout.on("data", c => { buf += c; let nl; while ((nl = buf.indexOf("\n")) >= 0) { const l = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1); if (!l) continue; let m; try { m = JSON.parse(l) } catch { continue }
@@ -51,7 +51,7 @@ test(`advanced harness: approval accept/decline, parallel tools, abort (${MODEL}
       if (m.method === "turn/started") shellItems = 0;
       if (m.method === "turn/completed") done = true; if (m.method === "turn/failed") { failed = JSON.stringify(m.params).slice(0,80); done = true } } });
 
-    const thread = async (policy) => { const ts = await send("thread/start", { model: MODEL, modelProvider: "litellm", cwd: WS, approvalPolicy: policy, sandbox: "workspace-write" }); return ts?.thread?.id ?? ts?.threadId; };
+    const thread = async (policy) => { const ts = await send("thread/start", { model: MODEL, modelProvider: "gemini", cwd: WS, approvalPolicy: policy, sandbox: "workspace-write" }); return ts?.thread?.id ?? ts?.threadId; };
     const turn = async (tid, text, ms = 120000) => { done = false; failed = null; shellItems = 0; await send("turn/start", { threadId: tid, input: [{ type: "text", text, text_elements: [] }] }); const t0 = Date.now(); while (!done && Date.now() - t0 < ms) await new Promise(r => setTimeout(r, 300)); return { ok: done && !failed, secs: (Date.now()-t0)/1000 }; };
 
     await send("initialize", { clientInfo: { name: "ha", version: "0" }, capabilities: null });

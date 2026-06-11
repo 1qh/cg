@@ -1,3 +1,0 @@
-# Pinned: the four bridge patches bind this proxy version's internals.
-# Guarded by the strict self-check; revisit trigger in adr/active-maintenance-exceptions.md.
-litellm[proxy]==1.88.1

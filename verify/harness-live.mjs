@@ -1,4 +1,4 @@
-// Comprehensive can-fail harness suite on the CURRENT stack (codex 0.138, litellm 1.88.1 + patches,
+// Comprehensive can-fail harness suite on the CURRENT stack (codex 0.138, gemini 1.88.1 + patches,
 // 3-tier catalog). Exercises every Codex harness capability the adapter must preserve, each as a can-fail
 // check, against the app-server. Grounding is verified separately (needs the injection env). Requires
 // GEMINI_API_KEY. PARITY_MODEL overrides the tier (default flash).
@@ -18,7 +18,7 @@ const CAT = join(ROOT, "bridge", "gemini-catalog.json");
 function startBridge() {
   const fd = openSync("/tmp/harness-live-bridge.log", "w");
   return spawn("scripts/bridge.sh", ["run", String(PORT)], {
-    cwd: ROOT, env: { ...process.env, LITELLM_MASTER_KEY: "sk-spike-local", LITELLM_PATCH_STRICT: "1" }, stdio: ["ignore", fd, fd] });
+    cwd: ROOT, env: { ...process.env }, stdio: ["ignore", fd, fd] });
 }
 async function health(ms){const e=Date.now()+ms;while(Date.now()<e){try{if((await fetch(`http://localhost:${PORT}/health/liveliness`,{signal:AbortSignal.timeout(1500)})).ok)return true}catch{}await new Promise(r=>setTimeout(r,500))}return false}
 
@@ -32,10 +32,10 @@ test(`harness capability suite (${MODEL})`, { timeout: 480000 }, async () => {
   const ck = (name, pass, detail = "") => results.push({ name, pass: !!pass, detail });
   try {
     assert.equal(await health(60000), true, "bridge must serve");
-    const cfg = ["-c","model_provider=litellm","-c",'model_providers.litellm.name="g"',
-      "-c",`model_providers.litellm.base_url="http://localhost:${PORT}/v1"`,"-c",'model_providers.litellm.wire_api="responses"',
-      "-c",'model_providers.litellm.env_key="LITELLM_KEY"',"-c",'model_reasoning_effort="high"',"-c",'model_reasoning_summary="detailed"',"-c",`model_catalog_json="${CAT}"`];
-    srv = spawn("codex", ["app-server", ...cfg], { env: { ...process.env, LITELLM_KEY: "sk-spike-local" }, stdio: ["pipe","pipe","pipe"] });
+    const cfg = ["-c","model_provider=gemini","-c",'model_providers.gemini.name="g"',
+      "-c",`model_providers.gemini.base_url="http://localhost:${PORT}/v1"`,"-c",'model_providers.gemini.wire_api="responses"',
+      "-c",'model_providers.gemini.env_key="BRIDGE_KEY"',"-c",'model_reasoning_effort="high"',"-c",'model_reasoning_summary="detailed"',"-c",`model_catalog_json="${CAT}"`];
+    srv = spawn("codex", ["app-server", ...cfg], { env: { ...process.env, BRIDGE_KEY: "sk-spike-local" }, stdio: ["pipe","pipe","pipe"] });
     let id = 1; const pend = new Map(); let buf = "", done = false, failed = null, msg = "", reasoning = 0, shell = 0, activeTurn = null, stderrErrs = 0;
     const notifs = new Set();
     srv.stderr?.on?.("data", d => { if (/OutputTextDelta without active item/.test(d.toString())) stderrErrs++; });
@@ -52,7 +52,7 @@ test(`harness capability suite (${MODEL})`, { timeout: 480000 }, async () => {
       if (m.method === "item/agentMessage/delta") msg += (m.params?.delta || "");
       if (m.method === "turn/completed") done = true; if (m.method === "turn/failed") { failed = JSON.stringify(m.params).slice(0,100); done = true } } });
 
-    const newThread = async () => { const ts = await send("thread/start", { model: MODEL, modelProvider: "litellm", cwd: WS, approvalPolicy: "never", sandbox: "workspace-write" }); return ts?.thread?.id ?? ts?.threadId; };
+    const newThread = async () => { const ts = await send("thread/start", { model: MODEL, modelProvider: "gemini", cwd: WS, approvalPolicy: "never", sandbox: "workspace-write" }); return ts?.thread?.id ?? ts?.threadId; };
     const turn = async (tid, text, ms = 120000) => { done = false; failed = null; msg = ""; reasoning = 0; shell = 0; await send("turn/start", { threadId: tid, input: [{ type: "text", text, text_elements: [] }] }); const t0 = Date.now(); while (!done && Date.now() - t0 < ms) await new Promise(r => setTimeout(r, 300)); return { ok: done && !failed, failed, msg, reasoning, shell }; };
 
     await send("initialize", { clientInfo: { name: "h", version: "0" }, capabilities: null });

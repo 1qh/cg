@@ -3,7 +3,7 @@
     {
       "slug": "gemini-3.1-pro-preview",
       "display_name": "Gemini 3.1 Pro",
-      "description": "Gemini 3.5 Flash via LiteLLM bridge",
+      "description": "Gemini 3.5 Flash via pure-Rust bridge",
       "context_window": 1048576,
       "max_output_tokens": 65536,
       "supports_reasoning_summaries": true,
@@ -53,7 +53,7 @@
     {
       "slug": "gemini-3.5-flash",
       "display_name": "Gemini 3.5 Flash",
-      "description": "Gemini 3.5 Flash via LiteLLM bridge",
+      "description": "Gemini 3.5 Flash via pure-Rust bridge",
       "context_window": 1048576,
       "max_output_tokens": 65536,
       "supports_reasoning_summaries": true,
@@ -103,7 +103,7 @@
     {
       "slug": "gemini-3.1-flash-lite",
       "display_name": "Gemini 3.1 Flash-Lite",
-      "description": "Gemini 3.5 Flash via LiteLLM bridge",
+      "description": "Gemini 3.5 Flash via pure-Rust bridge",
       "context_window": 1048576,
       "max_output_tokens": 65536,
       "supports_reasoning_summaries": true,

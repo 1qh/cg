@@ -19,7 +19,7 @@ function startBridge() {
   const fd = openSync("/tmp/parity-live-bridge.log", "w");
   return spawn("scripts/bridge.sh", ["run", String(PORT)], {
     cwd: ROOT,
-    env: { ...process.env, LITELLM_MASTER_KEY: "sk-spike-local", LITELLM_PATCH_STRICT: "1", LITELLM_INJECT_GROUNDING: "1" },
+    env: { ...process.env, INJECT_GROUNDING: "1" },
     stdio: ["ignore", fd, fd],
   });
 }
@@ -32,10 +32,10 @@ async function health(ms) {
   return false;
 }
 function appServer(wd) {
-  const cfg = ["-c","model_provider=litellm","-c",'model_providers.litellm.name="g"',
-    "-c",`model_providers.litellm.base_url="http://localhost:${PORT}/v1"`,"-c",'model_providers.litellm.wire_api="responses"',
-    "-c",'model_providers.litellm.env_key="LITELLM_KEY"',"-c",'model_reasoning_effort="high"',"-c",`model_catalog_json="${CAT}"`];
-  const srv = spawn("codex", ["app-server", ...cfg], { env: { ...process.env, LITELLM_KEY: "sk-spike-local" }, stdio: ["pipe","pipe","ignore"] });
+  const cfg = ["-c","model_provider=gemini","-c",'model_providers.gemini.name="g"',
+    "-c",`model_providers.gemini.base_url="http://localhost:${PORT}/v1"`,"-c",'model_providers.gemini.wire_api="responses"',
+    "-c",'model_providers.gemini.env_key="BRIDGE_KEY"',"-c",'model_reasoning_effort="high"',"-c",`model_catalog_json="${CAT}"`];
+  const srv = spawn("codex", ["app-server", ...cfg], { env: { ...process.env, BRIDGE_KEY: "sk-spike-local" }, stdio: ["pipe","pipe","ignore"] });
   let id = 1; const pend = new Map(); let buf = "", done = false, failed = null, msg = "";
   const send = (m, pa) => { const i = id++; srv.stdin.write(JSON.stringify({ method: m, id: i, params: pa }) + "\n"); return new Promise(r => pend.set(i, r)); };
   srv.stdout.on("data", c => { buf += c; let nl; while ((nl = buf.indexOf("\n")) >= 0) { const l = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1); if (!l) continue; let m; try { m = JSON.parse(l) } catch { continue }
@@ -60,7 +60,7 @@ test(`parity on ${MODEL}: multi-step coding + grounding via the real bridge`, { 
     execSync("git init -q && git commit -q --allow-empty -m i", { cwd: wd, env: { ...process.env, GIT_AUTHOR_NAME: "x", GIT_AUTHOR_EMAIL: "a@b.c", GIT_COMMITTER_NAME: "x", GIT_COMMITTER_EMAIL: "a@b.c" } });
     api = appServer(wd);
     await api.send("initialize", { clientInfo: { name: "pl", version: "0" }, capabilities: null });
-    const ts = await api.send("thread/start", { model: MODEL, modelProvider: "litellm", cwd: wd, approvalPolicy: "never", sandbox: "workspace-write" });
+    const ts = await api.send("thread/start", { model: MODEL, modelProvider: "gemini", cwd: wd, approvalPolicy: "never", sandbox: "workspace-write" });
     const threadId = ts?.thread?.id ?? ts?.threadId;
 
     const code = await api.run(threadId, "Create three files via separate shell commands one at a time: 'one'>a.txt, then 'two'>b.txt, then 'three'>c.txt. Then stop.", 150000);

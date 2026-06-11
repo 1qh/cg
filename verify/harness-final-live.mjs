@@ -16,7 +16,7 @@ const CAT = join(ROOT, "bridge", "gemini-catalog.json");
 function startBridge() {
   const fd = openSync("/tmp/harness-final-bridge.log", "w");
   return spawn("scripts/bridge.sh", ["run", String(PORT)], {
-    cwd: ROOT, env: { ...process.env, LITELLM_MASTER_KEY: "sk-spike-local", LITELLM_PATCH_STRICT: "1" }, stdio: ["ignore", fd, fd] });
+    cwd: ROOT, env: { ...process.env }, stdio: ["ignore", fd, fd] });
 }
 async function health(ms){const e=Date.now()+ms;while(Date.now()<e){try{if((await fetch(`http://localhost:${PORT}/health/liveliness`,{signal:AbortSignal.timeout(1500)})).ok)return true}catch{}await new Promise(r=>setTimeout(r,500))}return false}
 
@@ -29,10 +29,10 @@ test(`final harness: model list, error surfacing, sandbox enforcement (${MODEL})
   let srv; const results = []; const ck = (n, p, d = "") => results.push({ n, p: !!p, d });
   try {
     assert.equal(await health(60000), true, "bridge must serve");
-    const cfg = ["-c","model_provider=litellm","-c",'model_providers.litellm.name="g"',
-      "-c",`model_providers.litellm.base_url="http://localhost:${PORT}/v1"`,"-c",'model_providers.litellm.wire_api="responses"',
-      "-c",'model_providers.litellm.env_key="LITELLM_KEY"',"-c",'model_reasoning_effort="high"',"-c",`model_catalog_json="${CAT}"`];
-    srv = spawn("codex", ["app-server", ...cfg], { env: { ...process.env, LITELLM_KEY: "sk-spike-local" }, stdio: ["pipe","pipe","ignore"] });
+    const cfg = ["-c","model_provider=gemini","-c",'model_providers.gemini.name="g"',
+      "-c",`model_providers.gemini.base_url="http://localhost:${PORT}/v1"`,"-c",'model_providers.gemini.wire_api="responses"',
+      "-c",'model_providers.gemini.env_key="BRIDGE_KEY"',"-c",'model_reasoning_effort="high"',"-c",`model_catalog_json="${CAT}"`];
+    srv = spawn("codex", ["app-server", ...cfg], { env: { ...process.env, BRIDGE_KEY: "sk-spike-local" }, stdio: ["pipe","pipe","ignore"] });
     let id = 1; const pend = new Map(); let buf = "", done = false, failed = null;
     const send = (m, pa) => { const i = id++; srv.stdin.write(JSON.stringify({ method: m, id: i, params: pa }) + "\n"); return new Promise(r => pend.set(i, r)); };
     srv.stdout.on("data", c => { buf += c; let nl; while ((nl = buf.indexOf("\n")) >= 0) { const l = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1); if (!l) continue; let m; try { m = JSON.parse(l) } catch { continue }
@@ -50,10 +50,10 @@ test(`final harness: model list, error surfacing, sandbox enforcement (${MODEL})
     // structured error surfacing — a connection failure (bridge at a dead port) must FAIL cleanly, not hang
     const errOut = await new Promise((resolve) => {
       const p = spawn("codex", ["exec", "--skip-git-repo-check", "-C", WS,
-        "-c","model_provider=litellm","-c",'model_providers.litellm.name="g"',
-        "-c",'model_providers.litellm.base_url="http://localhost:59999/v1"',"-c",'model_providers.litellm.wire_api="responses"',
-        "-c",'model_providers.litellm.env_key="LITELLM_KEY"',"-c",`model="${MODEL}"`,"-c",`model_catalog_json="${CAT}"`],
-        { env: { ...process.env, LITELLM_KEY: "sk-spike-local" }, stdio: ["pipe","pipe","pipe"] });
+        "-c","model_provider=gemini","-c",'model_providers.gemini.name="g"',
+        "-c",'model_providers.gemini.base_url="http://localhost:59999/v1"',"-c",'model_providers.gemini.wire_api="responses"',
+        "-c",'model_providers.gemini.env_key="BRIDGE_KEY"',"-c",`model="${MODEL}"`,"-c",`model_catalog_json="${CAT}"`],
+        { env: { ...process.env, BRIDGE_KEY: "sk-spike-local" }, stdio: ["pipe","pipe","pipe"] });
       let o = ""; p.stdout.on("data", d => o += d); p.stderr.on("data", d => o += d);
       p.stdin.write("Say hi.\n"); p.stdin.end();
       let code = null; const t = setTimeout(() => { p.kill("SIGKILL"); resolve({ o, code, killed: true }); }, 45000);
@@ -62,7 +62,7 @@ test(`final harness: model list, error surfacing, sandbox enforcement (${MODEL})
     ck("error surfaces cleanly on connection failure (no hang)", !errOut.killed && /error|refus|connect|fail|stream/i.test(errOut.o), `exit=${errOut.code} ${errOut.o.slice(-60)}`);
 
     // OS sandbox enforcement — workspace-write must block a write OUTSIDE the workspace
-    const S = await send("thread/start", { model: MODEL, modelProvider: "litellm", cwd: WS, approvalPolicy: "never", sandbox: "workspace-write" });
+    const S = await send("thread/start", { model: MODEL, modelProvider: "gemini", cwd: WS, approvalPolicy: "never", sandbox: "workspace-write" });
     const sid = S?.thread?.id ?? S?.threadId;
     await turn(sid, `Run a shell command that writes the word ESCAPED to the absolute path ${escapePath} (outside this workspace).`, 120000);
     ck("sandbox blocks out-of-workspace write", !existsSync(escapePath), escapePath);

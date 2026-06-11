@@ -18,7 +18,7 @@ const CONCURRENCY = Number(process.env.BURST || "6");
 function startBridge() {
   const fd = openSync("/tmp/burst-sustained-bridge.log", "w");
   return spawn("scripts/bridge.sh", ["run", String(PORT)], {
-    cwd: ROOT, env: { ...process.env, LITELLM_MASTER_KEY: "sk-spike-local", LITELLM_PATCH_STRICT: "1" }, stdio: ["ignore", fd, fd] });
+    cwd: ROOT, env: { ...process.env }, stdio: ["ignore", fd, fd] });
 }
 async function health(ms){const e=Date.now()+ms;while(Date.now()<e){try{if((await fetch(`http://localhost:${PORT}/health/liveliness`,{signal:AbortSignal.timeout(1500)})).ok)return true}catch{}await new Promise(r=>setTimeout(r,500))}return false}
 

@@ -20,7 +20,7 @@ const FAIL_WINDOW_MS = 12000; // 503 for the first 12s -> codex's internal retri
 function startBridge() {
   const fd = openSync("/tmp/burst-bridge.log", "w");
   return spawn("scripts/bridge.sh", ["run", String(BRIDGE_PORT)], {
-    cwd: ROOT, env: { ...process.env, LITELLM_MASTER_KEY: "sk-spike-local", LITELLM_PATCH_STRICT: "1" }, stdio: ["ignore", fd, fd] });
+    cwd: ROOT, env: { ...process.env }, stdio: ["ignore", fd, fd] });
 }
 async function health(port, ms){const e=Date.now()+ms;while(Date.now()<e){try{if((await fetch(`http://localhost:${port}/health/liveliness`,{signal:AbortSignal.timeout(1500)})).ok)return true}catch{}await new Promise(r=>setTimeout(r,500))}return false}
 

@@ -16,7 +16,7 @@ const PORT = 4011;
 function startBridge() {
   return spawn("scripts/bridge.sh", ["run", String(PORT)], {
     cwd: ROOT,
-    env: { ...process.env, LITELLM_MASTER_KEY: "sk-spike-local", LITELLM_PATCH_STRICT: "1" },
+    env: { ...process.env },
     stdio: ["ignore", "ignore", "ignore"],
   });
 }
