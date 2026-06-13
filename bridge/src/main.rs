@@ -90,23 +90,17 @@ enum CodexInput {
         #[serde(default)]
         encrypted_content: Option<String>,
     },
-    /// Any other input item kind.
+    /// Any unrecognized input item kind.
     #[serde(other)]
-    Other,
+    Unknown,
 }
 /// Message author role.
 #[derive(Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum CodexRole {
-    /// Model assistant.
+    /// Model assistant; maps to the gemini Model role.
     Assistant,
-    /// Developer role.
-    Developer,
-    /// System role.
-    System,
-    /// End user.
-    User,
-    /// Any other role.
+    /// Every non-assistant role (user, system, developer, unknown); maps to the gemini User role.
     #[serde(other)]
     Other,
 }
@@ -428,7 +422,7 @@ fn push_input_item(
         CodexInput::FunctionCallOutput { call_id, output } => {
             push_function_output(contents, names, call_id, output);
         }
-        CodexInput::Other => {}
+        CodexInput::Unknown => {}
     }
 }
 

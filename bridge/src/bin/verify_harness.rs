@@ -18,10 +18,10 @@ use uuid as _;
 /// Whether one check passed or failed.
 #[derive(Clone, Copy)]
 enum Outcome {
-    /// The check passed.
-    Pass,
     /// The check failed.
     Fail,
+    /// The check passed.
+    Pass,
 }
 
 impl Outcome {
@@ -38,10 +38,10 @@ impl Outcome {
 /// Distinguishes a turn-style rpc (drained to turn completion) from a plain request/response rpc.
 #[derive(Clone, Copy)]
 enum RpcKind {
-    /// Drain until `turn/completed` or `turn/failed`.
-    Turn,
     /// Return as soon as the matching result arrives.
     Plain,
+    /// Drain until `turn/completed` or `turn/failed`.
+    Turn,
 }
 
 impl RpcKind {
