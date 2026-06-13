@@ -52,15 +52,15 @@ impl RpcKind {
 }
 
 /// Inputs for one `rpc` call: method, params, kind, and the sandbox policy.
-struct RpcCall<'a> {
+struct RpcCall<'call> {
     /// JSON-RPC method name.
-    method: &'a str,
+    method: &'call str,
     /// JSON-RPC params payload.
     params: Value,
     /// Whether this is a turn-style or plain rpc.
     kind: RpcKind,
     /// Sandbox policy passed through for thread-bound calls.
-    sandbox: &'a str,
+    sandbox: &'call str,
 }
 
 /// Aggregates pass/total counts and prints one PASS/FAIL line per check.
@@ -382,21 +382,37 @@ async fn run_checks(session: &mut Session, checker: &mut Checker, tid: &str) {
         .await;
     checker.check(
         "turn completes + message",
-        outcome(m1.contains("ALPHA_OK")),
+        if m1.contains("ALPHA_OK") {
+            Outcome::Pass
+        } else {
+            Outcome::Fail
+        },
         &format!("({})", &m1.chars().take(20).collect::<String>()),
     );
     checker.check(
         "reasoning surfaces",
-        outcome(r1 > 0),
+        if r1 > 0 { Outcome::Pass } else { Outcome::Fail },
         &format!("({r1} items)"),
     );
     let (m2, sh2, _) = session
         .turn(tid, "Run a shell command that prints exactly SHELL_OK_42.")
         .await;
-    checker.check("shell tool executes", outcome(sh2 > 0), &format!("({sh2})"));
+    checker.check(
+        "shell tool executes",
+        if sh2 > 0 {
+            Outcome::Pass
+        } else {
+            Outcome::Fail
+        },
+        &format!("({sh2})"),
+    );
     checker.check(
         "shell output reported",
-        outcome(m2.contains("SHELL_OK_42") || sh2 > 0),
+        if m2.contains("SHELL_OK_42") || sh2 > 0 {
+            Outcome::Pass
+        } else {
+            Outcome::Fail
+        },
         "",
     );
     discard(session.turn(tid, "Remember the number 31337.").await);
@@ -408,7 +424,11 @@ async fn run_checks(session: &mut Session, checker: &mut Checker, tid: &str) {
         .await;
     checker.check(
         "multi-turn continuity",
-        outcome(m4.contains("31337")),
+        if m4.contains("31337") {
+            Outcome::Pass
+        } else {
+            Outcome::Fail
+        },
         &format!("({})", &m4.chars().take(20).collect::<String>()),
     );
 }
@@ -430,11 +450,6 @@ fn report(checker: &Checker) {
             "see failures"
         }
     ));
-}
-
-/// Map a boolean check result to an `Outcome`.
-fn outcome(ok: bool) -> Outcome {
-    return if ok { Outcome::Pass } else { Outcome::Fail };
 }
 
 /// Initialize a git working dir for the harness threads; fatal on setup failure.

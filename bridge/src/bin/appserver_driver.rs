@@ -92,7 +92,7 @@ async fn send_turn_start(
     let tid = parsed
         .pointer("/result/thread/id")
         .and_then(Value::as_str)
-        .or_else(|| parsed.pointer("/result/threadId").and_then(Value::as_str))
+        .or_else(|| return parsed.pointer("/result/threadId").and_then(Value::as_str))
         .unwrap_or("")
         .to_owned();
     let request = rpc_line(
