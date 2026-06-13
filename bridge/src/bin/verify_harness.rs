@@ -26,7 +26,7 @@ enum Outcome {
 
 impl Outcome {
     /// True when this outcome is a pass.
-    fn passed(self) -> bool {
+    const fn passed(self) -> bool {
         return matches!(self, Self::Pass);
     }
     /// The label printed for this outcome.
@@ -46,7 +46,7 @@ enum RpcKind {
 
 impl RpcKind {
     /// True when this rpc drives a full turn.
-    fn is_turn(self) -> bool {
+    const fn is_turn(self) -> bool {
         return matches!(self, Self::Turn);
     }
 }
@@ -124,7 +124,9 @@ impl Session {
             discard(writeln!(stderr(), "BRIDGE_PORT env required (no fallback)"));
             return Err(());
         };
-        let mut child = Self::spawn_child(&port)?;
+        let Ok(mut child) = Self::spawn_child(&port) else {
+            return Err(());
+        };
         let Some(stdin) = child.stdin.take() else {
             discard(writeln!(stderr(), "child stdin unavailable"));
             return Err(());

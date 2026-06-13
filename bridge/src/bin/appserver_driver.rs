@@ -73,10 +73,9 @@ async fn send_thread_start(conn: &mut Conn<'_>, state: &mut DriveState) -> Resul
         &json!({"model":"gemini-3.5-flash","modelProvider":"r","cwd":cwd,"approvalPolicy":"never","sandbox":"read-only"}),
         conn.counter,
     );
-    conn.stdin
-        .write_all(request.as_bytes())
-        .await
-        .map_err(discard)?;
+    let Ok(()) = conn.stdin.write_all(request.as_bytes()).await else {
+        return Err(());
+    };
     state.phase = Phase::Pending;
     return Ok(());
 }
@@ -101,10 +100,9 @@ async fn send_turn_start(
         &json!({"threadId":tid,"input":[{"type":"text","text":"Reply with exactly: PURE_RUST_DRIVER_OK","text_elements":[]}]}),
         conn.counter,
     );
-    conn.stdin
-        .write_all(request.as_bytes())
-        .await
-        .map_err(discard)?;
+    let Ok(()) = conn.stdin.write_all(request.as_bytes()).await else {
+        return Err(());
+    };
     state.phase = Phase::Started;
     return Ok(());
 }
@@ -161,10 +159,9 @@ async fn reply_to_server_request(conn: &mut Conn<'_>, parsed: &Value) -> Result<
         return Ok(false);
     }
     let reply = format!("{}\n", json!({"id": parsed.get("id"), "result": {}}));
-    conn.stdin
-        .write_all(reply.as_bytes())
-        .await
-        .map_err(discard)?;
+    let Ok(()) = conn.stdin.write_all(reply.as_bytes()).await else {
+        return Err(());
+    };
     return Ok(true);
 }
 
@@ -180,10 +177,15 @@ async fn drive_line(conn: &mut Conn<'_>, state: &mut DriveState, rawline: &str) 
     let Ok(parsed) = serde_json::from_str::<Value>(trimmed) else {
         return Ok(());
     };
-    if reply_to_server_request(conn, &parsed).await? {
+    let Ok(replied) = reply_to_server_request(conn, &parsed).await else {
+        return Err(());
+    };
+    if replied {
         return Ok(());
     }
-    handle_result(conn, state, &parsed).await?;
+    let Ok(()) = handle_result(conn, state, &parsed).await else {
+        return Err(());
+    };
     handle_notification(state, &parsed);
     return Ok(());
 }
@@ -283,7 +285,9 @@ async fn start_session(
         &json!({"clientInfo":{"name":"x","version":"0"},"capabilities":null}),
         counter,
     );
-    stdin.write_all(init.as_bytes()).await.map_err(discard)?;
+    let Ok(()) = stdin.write_all(init.as_bytes()).await else {
+        return Err(());
+    };
     return Ok((child, stdin, lines));
 }
 
@@ -316,9 +320,13 @@ async fn run() -> Result<(), ()> {
         return Err(());
     };
     init_repo(&work_dir).await;
-    let port = read_port()?;
+    let Ok(port) = read_port() else {
+        return Err(());
+    };
     let mut counter = 1_u64;
-    let (mut child, mut stdin, mut lines) = start_session(&port, &mut counter).await?;
+    let Ok((mut child, mut stdin, mut lines)) = start_session(&port, &mut counter).await else {
+        return Err(());
+    };
     let outcome = drive(&mut stdin, &mut lines, &work_dir, &mut counter).await;
     discard(child.kill().await);
     print_outcome(&outcome);

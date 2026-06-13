@@ -237,7 +237,7 @@ fn discard<T>(_value: T) {}
 
 impl StreamState {
     /// Construct a zeroed accumulator at the start of a stream.
-    fn new() -> Self {
+    const fn new() -> Self {
         return Self {
             seq: 0_u64,
             text: String::new(),
