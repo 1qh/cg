@@ -2,32 +2,36 @@
 //! Spawn codex app-server -> initialize -> thread/start -> turn/start -> capture agent message + completion.
 //! If this works, the whole product (bridge + launcher + can-fail suite) can be pure Rust.
 use serde_json::{json, Value};
-use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
-use tokio::process::Command;
+use std::env::{temp_dir, var};
+use std::fs::create_dir_all;
+use std::io::{stdout, Error as IoError, Write as _};
+use std::path::Path;
+use std::process::{id as process_id, ExitCode, ExitStatus, Stdio};
+use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
-#[tokio::main]
-async fn main() {
-    let wd = std::env::temp_dir().join(format!("rsdrv-{}", std::process::id()));
-    std::fs::create_dir_all(&wd).unwrap();
-    let _ = Command::new("git")
+/// Initialize a throwaway git repo in `work_dir` so codex treats it as a project root.
+async fn init_repo(work_dir: &Path) {
+    let _: Result<ExitStatus, IoError> = Command::new("git")
         .args(["init", "-q"])
-        .current_dir(&wd)
+        .current_dir(work_dir)
         .status()
         .await;
-    let _ = Command::new("git")
+    let _: Result<ExitStatus, IoError> = Command::new("git")
         .args(["commit", "-q", "--allow-empty", "-m", "i"])
-        .current_dir(&wd)
+        .current_dir(work_dir)
         .env("GIT_AUTHOR_NAME", "x")
         .env("GIT_AUTHOR_EMAIL", "a@b.c")
         .env("GIT_COMMITTER_NAME", "x")
         .env("GIT_COMMITTER_EMAIL", "a@b.c")
         .status()
         .await;
+}
 
-    let port = std::env::var("BRIDGE_PORT").expect("BRIDGE_PORT env required (no fallback)");
+/// Spawn `codex app-server` wired to the BYOK provider on the bridge port.
+fn spawn_codex(port: &str) -> Result<Child, IoError> {
     let base_url = format!("model_providers.r.base_url=\"http://localhost:{port}/v1\"");
-    let mut child = Command::new("codex")
+    Command::new("codex")
         .args([
             "app-server",
             "-c",
@@ -46,74 +50,92 @@ async fn main() {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn codex");
-    let mut stdin = child.stdin.take().unwrap();
-    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-    let mut id = 1_u64;
-    let send = |m: &str, p: Value, id: &mut u64| {
-        let line = format!("{}\n", json!({"method": m, "id": *id, "params": p}));
-        *id += 1;
-        return line;
-    };
-    stdin
-        .write_all(
-            send(
-                "initialize",
-                json!({"clientInfo":{"name":"x","version":"0"},"capabilities":null}),
-                &mut id,
-            )
-            .as_bytes(),
-        )
-        .await
-        .unwrap();
+}
 
+/// Build one JSON-RPC request line and advance the request id counter.
+fn rpc_line(method: &str, params: Value, counter: &mut u64) -> String {
+    let line = format!("{}\n", json!({"method": method, "id": *counter, "params": params}));
+    *counter = (*counter).wrapping_add(1);
+    line
+}
+
+/// Outcome of driving the app-server: whether the turn finished and the captured reply.
+struct DriveOutcome {
+    /// Whether a `turn/completed` or `turn/failed` notification arrived.
+    done: bool,
+    /// The captured agent message text.
+    msg: String,
+}
+
+/// Drive the JSON-RPC loop: reply to server requests, start a thread, start a turn, capture the message.
+async fn drive(
+    stdin: &mut ChildStdin,
+    lines: &mut Lines<BufReader<ChildStdout>>,
+    work_dir: &Path,
+    counter: &mut u64,
+) -> DriveOutcome {
     let mut thread_id = String::new();
     let mut msg = String::new();
     let mut done = false;
     let mut started = false;
-    while let Ok(Some(l)) = lines.next_line().await {
-        let l = l.trim().to_owned();
-        if l.is_empty() {
+    while let Ok(Some(rawline)) = lines.next_line().await {
+        let trimmed = rawline.trim();
+        if trimmed.is_empty() {
             continue;
         }
-        let m: Value = match serde_json::from_str(&l) {
-            Ok(v) => v,
+        let parsed: Value = match serde_json::from_str(trimmed) {
+            Ok(value) => value,
             Err(_) => continue,
         };
-        if m.get("id").is_some() && m.get("method").is_some() {
-            stdin
-                .write_all(format!("{}\n", json!({"id": m["id"], "result": {}})).as_bytes())
-                .await
-                .unwrap();
+        if parsed.get("id").is_some() && parsed.get("method").is_some() {
+            let reply = format!("{}\n", json!({"id": parsed.get("id"), "result": {}}));
+            let Ok(()) = stdin.write_all(reply.as_bytes()).await else {
+                return DriveOutcome { done, msg };
+            };
             continue;
         }
-        if m.get("id").is_some() && m.get("result").is_some() && !started {
+        if parsed.get("id").is_some() && parsed.get("result").is_some() && !started {
             if thread_id.is_empty() {
-                stdin.write_all(send("thread/start", json!({"model":"gemini-3.5-flash","modelProvider":"r","cwd":wd.to_str().unwrap(),"approvalPolicy":"never","sandbox":"read-only"}), &mut id).as_bytes()).await.unwrap();
+                let cwd = work_dir.to_str().unwrap_or("");
+                let request = rpc_line(
+                    "thread/start",
+                    json!({"model":"gemini-3.5-flash","modelProvider":"r","cwd":cwd,"approvalPolicy":"never","sandbox":"read-only"}),
+                    counter,
+                );
+                let Ok(()) = stdin.write_all(request.as_bytes()).await else {
+                    return DriveOutcome { done, msg };
+                };
                 thread_id = "pending".into();
             } else if thread_id == "pending" {
-                let tid = m["result"]["thread"]["id"]
-                    .as_str()
-                    .or_else(|| return m["result"]["threadId"].as_str())
+                let tid = parsed
+                    .pointer("/result/thread/id")
+                    .and_then(Value::as_str)
+                    .or_else(|| parsed.pointer("/result/threadId").and_then(Value::as_str))
                     .unwrap_or("")
                     .to_owned();
                 thread_id = tid.clone();
-                stdin.write_all(send("turn/start", json!({"threadId":tid,"input":[{"type":"text","text":"Reply with exactly: PURE_RUST_DRIVER_OK","text_elements":[]}]}), &mut id).as_bytes()).await.unwrap();
+                let request = rpc_line(
+                    "turn/start",
+                    json!({"threadId":tid,"input":[{"type":"text","text":"Reply with exactly: PURE_RUST_DRIVER_OK","text_elements":[]}]}),
+                    counter,
+                );
+                let Ok(()) = stdin.write_all(request.as_bytes()).await else {
+                    return DriveOutcome { done, msg };
+                };
                 started = true;
             }
         }
-        if let Some(method) = m.get("method").and_then(Value::as_str) {
-            if let Some(it) = m.pointer("/params/item") {
-                if it.get("type").and_then(Value::as_str) == Some("agent_message") {
-                    if let Some(t) = it.get("text").and_then(Value::as_str) {
-                        msg = t.to_owned();
-                    }
-                }
+        if let Some(method) = parsed.get("method").and_then(Value::as_str) {
+            if let Some(item) = parsed.pointer("/params/item")
+                && item.get("type").and_then(Value::as_str) == Some("agent_message")
+                && let Some(text) = item.get("text").and_then(Value::as_str)
+            {
+                msg = text.to_owned();
             }
-            if method == "item/agentMessage/delta" {
-                if let Some(d) = m.pointer("/params/delta").and_then(Value::as_str) {
-                    msg.push_str(d);
-                }
+            if method == "item/agentMessage/delta"
+                && let Some(delta) = parsed.pointer("/params/delta").and_then(Value::as_str)
+            {
+                msg.push_str(delta);
             }
             if method == "turn/completed" || method == "turn/failed" {
                 done = true;
@@ -123,9 +145,51 @@ async fn main() {
             break;
         }
     }
-    let _ = child.kill().await;
-    println!("  pure-Rust driver: done={done} reply={msg:?}");
-    println!(
+    DriveOutcome { done, msg }
+}
+
+/// Run the spike: spawn codex app-server, drive it, print the proof line; `Err` signals a setup failure.
+async fn run() -> Result<(), ()> {
+    let work_dir = temp_dir().join(format!("rsdrv-{}", process_id()));
+    let Ok(()) = create_dir_all(&work_dir) else {
+        return Err(());
+    };
+    init_repo(&work_dir).await;
+
+    let Ok(port) = var("BRIDGE_PORT") else {
+        eprintln!("BRIDGE_PORT env required (no fallback)");
+        return Err(());
+    };
+    let Ok(mut child) = spawn_codex(&port) else {
+        return Err(());
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        return Err(());
+    };
+    let Some(child_stdout) = child.stdout.take() else {
+        return Err(());
+    };
+    let mut lines = BufReader::new(child_stdout).lines();
+    let mut counter = 1_u64;
+    let init = rpc_line(
+        "initialize",
+        json!({"clientInfo":{"name":"x","version":"0"},"capabilities":null}),
+        &mut counter,
+    );
+    let Ok(()) = stdin.write_all(init.as_bytes()).await else {
+        return Err(());
+    };
+
+    let outcome = drive(&mut stdin, &mut lines, &work_dir, &mut counter).await;
+    let _: Result<(), IoError> = child.kill().await;
+    let done = outcome.done;
+    let msg = outcome.msg;
+    let _: Result<(), IoError> = writeln!(
+        stdout(),
+        "  pure-Rust driver: done={done} reply={msg:?}"
+    );
+    let _: Result<(), IoError> = writeln!(
+        stdout(),
         "  >> {}",
         if done && msg.contains("PURE_RUST_DRIVER_OK") {
             "PROVEN \u{2014} pure Rust drives codex app-server e2e (verify harnesses can be Rust)"
@@ -133,4 +197,14 @@ async fn main() {
             "see above"
         }
     );
+    Ok(())
+}
+
+/// Spike entry point: delegate to `run`, mapping a setup failure to a non-zero exit code.
+#[tokio::main]
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(()) => ExitCode::FAILURE,
+    }
 }
