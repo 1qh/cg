@@ -133,16 +133,16 @@ impl Flow {
 
 /// Shared per-drain state threaded through each drained line.
 struct DrainCtx<'ctx> {
-    /// The request id this drain is collecting responses for.
-    myid: u64,
     /// Whether this drain drives a turn or a plain rpc.
     kind: RpcKind,
-    /// Sandbox policy passed through for thread-bound calls.
-    sandbox: &'ctx str,
+    /// The request id this drain is collecting responses for.
+    myid: u64,
     /// Accumulator folded across every drained line.
     out: &'ctx mut RpcOut,
     /// Whether the matching result has been observed yet.
     result_seen: bool,
+    /// Sandbox policy passed through for thread-bound calls.
+    sandbox: &'ctx str,
 }
 
 impl Session {
@@ -162,17 +162,15 @@ impl Session {
     async fn drain(&mut self, myid: u64, kind: RpcKind, sandbox: &str) -> RpcOut {
         let mut out = RpcOut::empty();
         let mut ctx = DrainCtx {
-            myid,
             kind,
-            sandbox,
+            myid,
             out: &mut out,
             result_seen: false,
+            sandbox,
         };
-        while let Ok(Some(raw_line)) = self.lines.next_line().await {
-            if self.step(&raw_line, &mut ctx).await.stops() {
-                break;
-            }
-        }
+        while let Ok(Some(raw_line)) = self.lines.next_line().await
+            && !self.step(&raw_line, &mut ctx).await.stops()
+        {}
         return out;
     }
     /// Spawn `codex app-server` against the local bridge and run `initialize`.

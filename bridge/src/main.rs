@@ -399,11 +399,8 @@ fn collect_call_names(req: &CodexReq) -> HashMap<String, String> {
 }
 
 /// Capture a non-empty replayed reasoning signature as the pending signature.
-fn capture_pending_sig(pending_sig: &mut Option<String>, encrypted_content: &Option<String>) {
-    let Some(enc) = encrypted_content
-        .as_ref()
-        .filter(|enc| return !enc.is_empty())
-    else {
+fn capture_pending_sig(pending_sig: &mut Option<String>, encrypted_content: Option<&String>) {
+    let Some(enc) = encrypted_content.filter(|enc| return !enc.is_empty()) else {
         return;
     };
     *pending_sig = Some(enc.clone());
@@ -421,7 +418,7 @@ fn push_input_item(
             push_message(contents, role, content);
         }
         CodexInput::Reasoning { encrypted_content } => {
-            capture_pending_sig(pending_sig, encrypted_content);
+            capture_pending_sig(pending_sig, encrypted_content.as_ref());
         }
         CodexInput::FunctionCall {
             name, arguments, ..
@@ -920,20 +917,28 @@ async fn emit_function_calls(
     return true;
 }
 
+/// Run the consume->flush->close->function-call stages; false if the receiver closed mid-stream.
+async fn run_stream_stages(
+    sender: &Sender<Result<Event, Infallible>>,
+    state: &mut StreamState,
+    stream: GenerationStream,
+) -> bool {
+    return Box::pin(consume_stream(sender, state, stream)).await
+        && flush_reasoning(sender, state).await
+        && close_message(sender, state).await
+        && emit_function_calls(sender, state).await;
+}
+
+/// Drive the gemini stream through every emit stage, then emit the terminal lifecycle event.
 async fn drive_stream(
     sender: &Sender<Result<Event, Infallible>>,
     state: &mut StreamState,
     stream: GenerationStream,
     meta: RespMeta<'_>,
 ) {
-    if !Box::pin(consume_stream(sender, state, stream)).await
-        || !flush_reasoning(sender, state).await
-        || !close_message(sender, state).await
-        || !emit_function_calls(sender, state).await
-    {
-        return;
+    if run_stream_stages(sender, state, stream).await {
+        emit_terminal(sender, state, meta).await;
     }
-    emit_terminal(sender, state, meta).await;
 }
 
 /// Drive the gemini stream and emit the typed responses event sequence.
