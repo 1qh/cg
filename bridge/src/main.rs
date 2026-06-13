@@ -40,15 +40,15 @@ use uuid::Uuid;
 #[derive(Deserialize, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 enum CodexEffort {
-    /// High thinking.
+    /// Maps to gemini `thinkingLevel` High.
     High,
-    /// Low thinking.
+    /// Maps to gemini `thinkingLevel` Low.
     Low,
-    /// Medium thinking.
+    /// Maps to gemini `thinkingLevel` Medium.
     Medium,
-    /// Minimal thinking.
+    /// Maps to gemini `thinkingLevel` Minimal.
     Minimal,
-    /// Extra-high thinking (clamped to high).
+    /// Codex's xhigh; gemini rejects it, so it clamps to `thinkingLevel` High.
     Xhigh,
 }
 /// Tagged union of codex per-turn input items.
@@ -232,9 +232,6 @@ struct StreamState {
     usage: Option<ResponseUsage>,
 }
 
-/// Discard a value to satisfy must-use / non-binding-let lints without altering behavior.
-fn discard<T>(_value: T) {}
-
 impl StreamState {
     /// Construct a zeroed accumulator at the start of a stream.
     const fn new() -> Self {
@@ -265,6 +262,9 @@ struct RespMeta<'meta> {
     /// The response id stamped on every event.
     response_id: &'meta str,
 }
+
+/// Discard a value to satisfy must-use / non-binding-let lints without altering behavior.
+fn discard<T>(_value: T) {}
 
 /// Build the responses `Response` envelope shared across stream events.
 fn make_response(
@@ -387,39 +387,61 @@ fn push_function_output(
     );
 }
 
-/// Reconstruct the gemini contents vector from the codex per-turn input array.
-fn build_contents(req: &CodexReq) -> Vec<Content> {
+/// Map each function-call `call_id` to its declared name across the input array.
+fn collect_call_names(req: &CodexReq) -> HashMap<String, String> {
     let mut names: HashMap<String, String> = HashMap::new();
     for item in &req.input {
         if let CodexInput::FunctionCall { call_id, name, .. } = item {
             discard(names.insert(call_id.clone(), name.clone()));
         }
     }
+    return names;
+}
+
+/// Capture a non-empty replayed reasoning signature as the pending signature.
+fn capture_pending_sig(pending_sig: &mut Option<String>, encrypted_content: &Option<String>) {
+    let Some(enc) = encrypted_content
+        .as_ref()
+        .filter(|enc| return !enc.is_empty())
+    else {
+        return;
+    };
+    *pending_sig = Some(enc.clone());
+}
+
+/// Translate one codex input item into the gemini contents vector.
+fn push_input_item(
+    contents: &mut Vec<Content>,
+    names: &HashMap<String, String>,
+    pending_sig: &mut Option<String>,
+    item: &CodexInput,
+) {
+    match item {
+        CodexInput::Message { role, content } => {
+            push_message(contents, role, content);
+        }
+        CodexInput::Reasoning { encrypted_content } => {
+            capture_pending_sig(pending_sig, encrypted_content);
+        }
+        CodexInput::FunctionCall {
+            name, arguments, ..
+        } => {
+            push_function_call(contents, pending_sig, name, arguments);
+        }
+        CodexInput::FunctionCallOutput { call_id, output } => {
+            push_function_output(contents, names, call_id, output);
+        }
+        CodexInput::Other => {}
+    }
+}
+
+/// Reconstruct the gemini contents vector from the codex per-turn input array.
+fn build_contents(req: &CodexReq) -> Vec<Content> {
+    let names = collect_call_names(req);
     let mut contents: Vec<Content> = Vec::new();
     let mut pending_sig: Option<String> = None;
     for item in &req.input {
-        match item {
-            CodexInput::Message { role, content } => {
-                push_message(&mut contents, role, content);
-            }
-            CodexInput::Reasoning { encrypted_content } => {
-                if let Some(enc) = encrypted_content
-                    .as_ref()
-                    .filter(|enc| return !enc.is_empty())
-                {
-                    pending_sig = Some(enc.clone());
-                }
-            }
-            CodexInput::FunctionCall {
-                name, arguments, ..
-            } => {
-                push_function_call(&mut contents, &mut pending_sig, name, arguments);
-            }
-            CodexInput::FunctionCallOutput { call_id, output } => {
-                push_function_output(&mut contents, &names, call_id, output);
-            }
-            CodexInput::Other => {}
-        }
+        push_input_item(&mut contents, &names, &mut pending_sig, item);
     }
     return contents;
 }
@@ -885,6 +907,19 @@ async fn send_failed(
 }
 
 /// Drain a live gemini stream into the typed responses event sequence.
+/// Emit every queued function call in order; returns false if the receiver closed.
+async fn emit_function_calls(
+    sender: &Sender<Result<Event, Infallible>>,
+    state: &mut StreamState,
+) -> bool {
+    for (name, args) in take(&mut state.fcs) {
+        if !Box::pin(emit_function_call(sender, state, name, args)).await {
+            return false;
+        }
+    }
+    return true;
+}
+
 async fn drive_stream(
     sender: &Sender<Result<Event, Infallible>>,
     state: &mut StreamState,
@@ -894,13 +929,9 @@ async fn drive_stream(
     if !Box::pin(consume_stream(sender, state, stream)).await
         || !flush_reasoning(sender, state).await
         || !close_message(sender, state).await
+        || !emit_function_calls(sender, state).await
     {
         return;
-    }
-    for (name, args) in take(&mut state.fcs) {
-        if !Box::pin(emit_function_call(sender, state, name, args)).await {
-            return;
-        }
     }
     emit_terminal(sender, state, meta).await;
 }

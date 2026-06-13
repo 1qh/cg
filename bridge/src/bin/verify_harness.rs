@@ -124,6 +124,27 @@ enum Flow {
     Done,
 }
 
+impl Flow {
+    /// True when draining should stop on this signal.
+    const fn stops(&self) -> bool {
+        return matches!(*self, Self::Done | Self::Abort);
+    }
+}
+
+/// Shared per-drain state threaded through each drained line.
+struct DrainCtx<'ctx> {
+    /// The request id this drain is collecting responses for.
+    myid: u64,
+    /// Whether this drain drives a turn or a plain rpc.
+    kind: RpcKind,
+    /// Sandbox policy passed through for thread-bound calls.
+    sandbox: &'ctx str,
+    /// Accumulator folded across every drained line.
+    out: &'ctx mut RpcOut,
+    /// Whether the matching result has been observed yet.
+    result_seen: bool,
+}
+
 impl Session {
     /// Acknowledge a server-initiated request by echoing its id with an empty result.
     ///
@@ -140,14 +161,16 @@ impl Session {
     /// Drain responses for request `myid` until the turn or plain rpc concludes.
     async fn drain(&mut self, myid: u64, kind: RpcKind, sandbox: &str) -> RpcOut {
         let mut out = RpcOut::empty();
-        let mut result_seen = false;
+        let mut ctx = DrainCtx {
+            myid,
+            kind,
+            sandbox,
+            out: &mut out,
+            result_seen: false,
+        };
         while let Ok(Some(raw_line)) = self.lines.next_line().await {
-            let flow = self
-                .step(&raw_line, myid, kind, sandbox, &mut out, &mut result_seen)
-                .await;
-            match flow {
-                Flow::Continue => {}
-                Flow::Done | Flow::Abort => break,
+            if self.step(&raw_line, &mut ctx).await.stops() {
+                break;
             }
         }
         return out;
@@ -252,15 +275,7 @@ impl Session {
             .tid;
     }
     /// Process one drained line and fold its effect into the accumulator.
-    async fn step(
-        &mut self,
-        raw_line: &str,
-        myid: u64,
-        kind: RpcKind,
-        sandbox: &str,
-        out: &mut RpcOut,
-        result_seen: &mut bool,
-    ) -> Flow {
+    async fn step(&mut self, raw_line: &str, ctx: &mut DrainCtx<'_>) -> Flow {
         let trimmed = raw_line.trim().to_owned();
         let Some(msg_value) = parse_line(&trimmed) else {
             return Flow::Continue;
@@ -271,13 +286,13 @@ impl Session {
                 Err(()) => Flow::Abort,
             };
         }
-        if record_result(&msg_value, myid, kind, sandbox, out, result_seen) {
+        if record_result(&msg_value, ctx) {
             return Flow::Done;
         }
-        if apply_event(&msg_value, kind, out) {
+        if apply_event(&msg_value, ctx.kind, ctx.out) {
             return Flow::Done;
         }
-        if *result_seen && !kind.is_turn() {
+        if ctx.result_seen && !ctx.kind.is_turn() {
             return Flow::Done;
         }
         return Flow::Continue;
@@ -328,23 +343,16 @@ fn matches_result(msg_value: &Value, myid: u64) -> bool {
 }
 
 /// Capture the thread id from a matching result and report whether a plain rpc should stop.
-fn record_result(
-    msg_value: &Value,
-    myid: u64,
-    kind: RpcKind,
-    sandbox: &str,
-    out: &mut RpcOut,
-    result_seen: &mut bool,
-) -> bool {
-    if !matches_result(msg_value, myid) {
+fn record_result(msg_value: &Value, ctx: &mut DrainCtx<'_>) -> bool {
+    if !matches_result(msg_value, ctx.myid) {
         return false;
     }
-    out.tid = read_thread_id(msg_value);
-    *result_seen = true;
-    if kind.is_turn() {
+    ctx.out.tid = read_thread_id(msg_value);
+    ctx.result_seen = true;
+    if ctx.kind.is_turn() {
         return false;
     }
-    discard(sandbox);
+    discard(ctx.sandbox);
     return true;
 }
 

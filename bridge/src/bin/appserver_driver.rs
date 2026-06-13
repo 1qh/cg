@@ -204,9 +204,9 @@ async fn drive(
         done: false,
     };
     let mut conn = Conn {
+        counter,
         stdin,
         work_dir,
-        counter,
     };
     while let Ok(Some(rawline)) = lines.next_line().await {
         if drive_line(&mut conn, &mut state, &rawline).await.is_err() || state.done {
