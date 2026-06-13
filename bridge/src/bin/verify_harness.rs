@@ -15,6 +15,54 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio_stream as _;
 use uuid as _;
 
+/// Whether one check passed or failed.
+#[derive(Clone, Copy)]
+enum Outcome {
+    /// The check passed.
+    Pass,
+    /// The check failed.
+    Fail,
+}
+
+impl Outcome {
+    /// True when this outcome is a pass.
+    fn passed(self) -> bool {
+        return matches!(self, Self::Pass);
+    }
+    /// The label printed for this outcome.
+    fn label(self) -> &'static str {
+        return if self.passed() { "PASS" } else { "FAIL" };
+    }
+}
+
+/// Distinguishes a turn-style rpc (drained to turn completion) from a plain request/response rpc.
+#[derive(Clone, Copy)]
+enum RpcKind {
+    /// Drain until `turn/completed` or `turn/failed`.
+    Turn,
+    /// Return as soon as the matching result arrives.
+    Plain,
+}
+
+impl RpcKind {
+    /// True when this rpc drives a full turn.
+    fn is_turn(self) -> bool {
+        return matches!(self, Self::Turn);
+    }
+}
+
+/// Inputs for one `rpc` call: method, params, kind, and the sandbox policy.
+struct RpcCall<'a> {
+    /// JSON-RPC method name.
+    method: &'a str,
+    /// JSON-RPC params payload.
+    params: Value,
+    /// Whether this is a turn-style or plain rpc.
+    kind: RpcKind,
+    /// Sandbox policy passed through for thread-bound calls.
+    sandbox: &'a str,
+}
+
 /// Aggregates pass/total counts and prints one PASS/FAIL line per check.
 struct Checker {
     /// Number of checks that passed.
@@ -51,15 +99,15 @@ struct Session {
 
 impl Checker {
     /// Record one check outcome and print its result line.
-    fn check(&mut self, name: &str, ok: bool, detail: &str) {
+    fn check(&mut self, name: &str, outcome: Outcome, detail: &str) {
         self.total = self.total.wrapping_add(1);
-        if ok {
+        if outcome.passed() {
             self.pass = self.pass.wrapping_add(1);
         }
         discard(writeln!(
             stdout(),
             "  {} {} {}",
-            if ok { "PASS" } else { "FAIL" },
+            outcome.label(),
             name,
             detail
         ));
@@ -68,11 +116,48 @@ impl Checker {
 
 impl Session {
     /// Spawn `codex app-server` against the local bridge and run `initialize`.
+    ///
+    /// # Errors
+    /// Returns `Err(())` when `BRIDGE_PORT` is unset, the spawn fails, or a child pipe is unavailable.
     async fn new(wd: &str, sandbox: &str) -> Result<Self, ()> {
         let Ok(port) = var("BRIDGE_PORT") else {
             discard(writeln!(stderr(), "BRIDGE_PORT env required (no fallback)"));
             return Err(());
         };
+        let mut child = Self::spawn_child(&port)?;
+        let Some(stdin) = child.stdin.take() else {
+            discard(writeln!(stderr(), "child stdin unavailable"));
+            return Err(());
+        };
+        let Some(stdout) = child.stdout.take() else {
+            discard(writeln!(stderr(), "child stdout unavailable"));
+            return Err(());
+        };
+        let lines = BufReader::new(stdout).lines();
+        let mut session = Self {
+            child,
+            id: 1,
+            lines,
+            stdin,
+            wd: wd.into(),
+        };
+        discard(
+            session
+                .rpc(RpcCall {
+                    method: "initialize",
+                    params: json!({"clientInfo":{"name":"x","version":"0"},"capabilities":null}),
+                    kind: RpcKind::Plain,
+                    sandbox,
+                })
+                .await,
+        );
+        return Ok(session);
+    }
+    /// Spawn the `codex app-server` child wired at the given bridge port.
+    ///
+    /// # Errors
+    /// Returns `Err(())` when the process fails to spawn.
+    fn spawn_child(port: &str) -> Result<Child, ()> {
         let base_url = format!("model_providers.r.base_url=\"http://localhost:{port}/v1\"");
         let spawned = Command::new("codex")
             .args([
@@ -93,200 +178,241 @@ impl Session {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn();
-        let mut child = match spawned {
-            Ok(spawned_child) => spawned_child,
+        return match spawned {
+            Ok(spawned_child) => Ok(spawned_child),
             Err(err) => {
                 discard(writeln!(stderr(), "spawn codex failed: {err}"));
-                return Err(());
+                Err(())
             }
         };
-        let Some(stdin) = child.stdin.take() else {
-            discard(writeln!(stderr(), "child stdin unavailable"));
-            return Err(());
-        };
-        let Some(stdout) = child.stdout.take() else {
-            discard(writeln!(stderr(), "child stdout unavailable"));
-            return Err(());
-        };
-        let lines = BufReader::new(stdout).lines();
-        let mut session = Self {
-            child,
-            id: 1,
-            lines,
-            stdin,
-            wd: wd.into(),
-        };
-        discard(
-            session
-                .rpc(
-                    "initialize",
-                    json!({"clientInfo":{"name":"x","version":"0"},"capabilities":null}),
-                    false,
-                    sandbox,
-                )
-                .await,
-        );
-        return Ok(session);
     }
     /// Send one JSON-RPC request, drain responses, and summarize the turn.
-    async fn rpc(&mut self, method: &str, params: Value, is_turn: bool, sandbox: &str) -> RpcOut {
+    async fn rpc(&mut self, call: RpcCall<'_>) -> RpcOut {
         let myid = self.id;
         self.id = self.id.wrapping_add(1);
-        let request_line = format!("{}\n", json!({"method":method,"id":myid,"params":params}));
+        let request_line = format!(
+            "{}\n",
+            json!({"method":call.method,"id":myid,"params":call.params})
+        );
         if let Err(err) = self.stdin.write_all(request_line.as_bytes()).await {
             discard(writeln!(stderr(), "stdin write failed: {err}"));
-            return RpcOut {
-                msg: String::new(),
-                reasoning: 0_u32,
-                shell: 0_u32,
-                tid: String::new(),
-            };
+            return RpcOut::empty();
         }
-        let (mut msg, mut shell, mut reasoning, mut tid) =
-            (String::new(), 0_u32, 0_u32, String::new());
+        return self.drain(myid, call.kind, call.sandbox).await;
+    }
+    /// Drain responses for request `myid` until the turn or plain rpc concludes.
+    async fn drain(&mut self, myid: u64, kind: RpcKind, sandbox: &str) -> RpcOut {
+        let mut out = RpcOut::empty();
         let mut result_seen = false;
         while let Ok(Some(raw_line)) = self.lines.next_line().await {
             let trimmed = raw_line.trim().to_owned();
-            if trimmed.is_empty() {
+            let Some(msg_value) = parse_line(&trimmed) else {
                 continue;
-            }
-            let msg_value: Value = match serde_json::from_str(&trimmed) {
-                Ok(parsed) => parsed,
-                Err(_) => continue,
             };
-            if msg_value.get("id").is_some() && msg_value.get("method").is_some() {
-                let ack = format!("{}\n", json!({"id":msg_value.get("id"),"result":{}}));
-                if let Err(err) = self.stdin.write_all(ack.as_bytes()).await {
-                    discard(writeln!(stderr(), "stdin ack write failed: {err}"));
-                    return RpcOut {
-                        msg,
-                        reasoning,
-                        shell,
-                        tid,
-                    };
+            if is_server_request(&msg_value) {
+                if self.ack(&msg_value).await.is_err() {
+                    return out;
                 }
                 continue;
             }
-            if msg_value.get("id").and_then(|value| return value.as_u64()) == Some(myid)
-                && msg_value.get("result").is_some()
-            {
-                tid = msg_value
-                    .pointer("/result/thread/id")
-                    .and_then(Value::as_str)
-                    .or_else(|| {
-                        return msg_value
-                            .pointer("/result/threadId")
-                            .and_then(Value::as_str);
-                    })
-                    .unwrap_or("")
-                    .to_owned();
+            if matches_result(&msg_value, myid) {
+                out.tid = read_thread_id(&msg_value);
                 result_seen = true;
-                if !is_turn {
+                if !kind.is_turn() {
                     discard(sandbox);
                     break;
                 }
             }
-            if let Some(event_method) = msg_value.get("method").and_then(Value::as_str) {
-                if let Some(item) = msg_value.pointer("/params/item") {
-                    match item.get("type").and_then(Value::as_str) {
-                        Some("agent_message") => {
-                            if let Some(text) = item.get("text").and_then(Value::as_str) {
-                                msg = text.into();
-                            }
-                        }
-                        Some(item_type) if item_type.contains("command") => {
-                            shell = shell.wrapping_add(1);
-                        }
-                        Some("reasoning") => reasoning = reasoning.wrapping_add(1),
-                        _ => {}
-                    }
-                }
-                if event_method == "item/agentMessage/delta"
-                    && let Some(delta) = msg_value.pointer("/params/delta").and_then(Value::as_str)
-                {
-                    msg.push_str(delta);
-                }
-                if (event_method == "turn/completed" || event_method == "turn/failed") && is_turn {
-                    break;
-                }
+            if apply_event(&msg_value, kind, &mut out) {
+                break;
             }
-            if result_seen && !is_turn {
+            if result_seen && !kind.is_turn() {
                 break;
             }
         }
-        return RpcOut {
-            msg,
-            reasoning,
-            shell,
-            tid,
-        };
+        return out;
+    }
+    /// Acknowledge a server-initiated request by echoing its id with an empty result.
+    ///
+    /// # Errors
+    /// Returns `Err(())` when the stdin write fails.
+    async fn ack(&mut self, msg_value: &Value) -> Result<(), ()> {
+        let ack = format!("{}\n", json!({"id":msg_value.get("id"),"result":{}}));
+        if let Err(err) = self.stdin.write_all(ack.as_bytes()).await {
+            discard(writeln!(stderr(), "stdin ack write failed: {err}"));
+            return Err(());
+        }
+        return Ok(());
     }
     /// Start a new thread bound to the BYOK model and return its thread id.
     async fn start_thread(&mut self, sandbox: &str) -> String {
-        return self.rpc("thread/start", json!({"model":"gemini-3.5-flash","modelProvider":"r","cwd":self.wd,"approvalPolicy":"never","sandbox":sandbox}), false, sandbox).await.tid;
+        return self
+            .rpc(RpcCall {
+                method: "thread/start",
+                params: json!({"model":"gemini-3.5-flash","modelProvider":"r","cwd":self.wd,"approvalPolicy":"never","sandbox":sandbox}),
+                kind: RpcKind::Plain,
+                sandbox,
+            })
+            .await
+            .tid;
     }
     /// Run one turn with the given text input and return message + shell + reasoning counts.
     async fn turn(&mut self, tid: &str, text: &str) -> (String, u32, u32) {
         let out = self
-            .rpc(
-                "turn/start",
-                json!({"threadId":tid,"input":[{"type":"text","text":text,"text_elements":[]}]}),
-                true,
-                "",
-            )
+            .rpc(RpcCall {
+                method: "turn/start",
+                params: json!({"threadId":tid,"input":[{"type":"text","text":text,"text_elements":[]}]}),
+                kind: RpcKind::Turn,
+                sandbox: "",
+            })
             .await;
         return (out.msg, out.shell, out.reasoning);
+    }
+}
+
+impl RpcOut {
+    /// An empty result with zeroed counters and blank strings.
+    fn empty() -> Self {
+        return Self {
+            msg: String::new(),
+            reasoning: 0_u32,
+            shell: 0_u32,
+            tid: String::new(),
+        };
+    }
+}
+
+/// Parse one trimmed line into a JSON value, skipping blank or invalid lines.
+fn parse_line(trimmed: &str) -> Option<Value> {
+    if trimmed.is_empty() {
+        return None;
+    }
+    return serde_json::from_str(trimmed).ok();
+}
+
+/// True when the value is a server-initiated request (has both id and method).
+fn is_server_request(msg_value: &Value) -> bool {
+    return msg_value.get("id").is_some() && msg_value.get("method").is_some();
+}
+
+/// True when the value is the result for request `myid`.
+fn matches_result(msg_value: &Value, myid: u64) -> bool {
+    return msg_value.get("id").and_then(Value::as_u64) == Some(myid)
+        && msg_value.get("result").is_some();
+}
+
+/// Read the thread id from a result value, trying both pointer shapes.
+fn read_thread_id(msg_value: &Value) -> String {
+    return msg_value
+        .pointer("/result/thread/id")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            msg_value
+                .pointer("/result/threadId")
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("")
+        .to_owned();
+}
+
+/// Apply one event message to the accumulator; returns true when the turn should end.
+fn apply_event(msg_value: &Value, kind: RpcKind, out: &mut RpcOut) -> bool {
+    let Some(event_method) = msg_value.get("method").and_then(Value::as_str) else {
+        return false;
+    };
+    if let Some(item) = msg_value.pointer("/params/item") {
+        apply_item(item, out);
+    }
+    if event_method == "item/agentMessage/delta"
+        && let Some(delta) = msg_value.pointer("/params/delta").and_then(Value::as_str)
+    {
+        out.msg.push_str(delta);
+    }
+    return (event_method == "turn/completed" || event_method == "turn/failed") && kind.is_turn();
+}
+
+/// Fold one item event into the accumulator (agent message, shell command, or reasoning).
+fn apply_item(item: &Value, out: &mut RpcOut) {
+    match item.get("type").and_then(Value::as_str) {
+        Some("agent_message") => {
+            if let Some(text) = item.get("text").and_then(Value::as_str) {
+                out.msg = text.into();
+            }
+        }
+        Some(item_type) if item_type.contains("command") => {
+            out.shell = out.shell.wrapping_add(1);
+        }
+        Some("reasoning") => out.reasoning = out.reasoning.wrapping_add(1),
+        _ => {}
     }
 }
 
 /// Swallow a value, marking it intentionally unused.
 fn discard<T>(_value: T) {}
 
+/// Entry point: set up the workdir, drive the capability checks, and report.
+///
+/// # Panics
+/// Does not panic.
 #[tokio::main]
 async fn main() -> ExitCode {
     let Ok(wds) = setup_workdir().await else {
         return ExitCode::FAILURE;
     };
-    let mut checker = Checker { pass: 0, total: 0 };
-
     let Ok(mut session) = Session::new(&wds, "workspace-write").await else {
         return ExitCode::FAILURE;
     };
+    let mut checker = Checker { pass: 0, total: 0 };
     let tid = session.start_thread("workspace-write").await;
+    run_checks(&mut session, &mut checker, &tid).await;
+    discard(session.child.kill().await);
+    report(&checker);
+    return ExitCode::SUCCESS;
+}
+
+/// Drive the capability checks against the session and record each outcome.
+async fn run_checks(session: &mut Session, checker: &mut Checker, tid: &str) {
     let (m1, _, r1) = session
         .turn(
-            &tid,
+            tid,
             "Think step by step why 17 is prime, then reply with exactly ALPHA_OK.",
         )
         .await;
     checker.check(
         "turn completes + message",
-        m1.contains("ALPHA_OK"),
+        outcome(m1.contains("ALPHA_OK")),
         &format!("({})", &m1.chars().take(20).collect::<String>()),
     );
-    checker.check("reasoning surfaces", r1 > 0, &format!("({r1} items)"));
+    checker.check(
+        "reasoning surfaces",
+        outcome(r1 > 0),
+        &format!("({r1} items)"),
+    );
     let (m2, sh2, _) = session
-        .turn(&tid, "Run a shell command that prints exactly SHELL_OK_42.")
+        .turn(tid, "Run a shell command that prints exactly SHELL_OK_42.")
         .await;
-    checker.check("shell tool executes", sh2 > 0, &format!("({sh2})"));
+    checker.check("shell tool executes", outcome(sh2 > 0), &format!("({sh2})"));
     checker.check(
         "shell output reported",
-        m2.contains("SHELL_OK_42") || sh2 > 0,
+        outcome(m2.contains("SHELL_OK_42") || sh2 > 0),
         "",
     );
-    discard(session.turn(&tid, "Remember the number 31337.").await);
+    discard(session.turn(tid, "Remember the number 31337.").await);
     let (m4, _, _) = session
         .turn(
-            &tid,
+            tid,
             "What number did I ask you to remember? Reply with just the number.",
         )
         .await;
     checker.check(
         "multi-turn continuity",
-        m4.contains("31337"),
+        outcome(m4.contains("31337")),
         &format!("({})", &m4.chars().take(20).collect::<String>()),
     );
-    discard(session.child.kill().await);
+}
+
+/// Print the harness summary and the proof line.
+fn report(checker: &Checker) {
     let pass = checker.pass;
     let total = checker.total;
     discard(writeln!(
@@ -302,10 +428,20 @@ async fn main() -> ExitCode {
             "see failures"
         }
     ));
-    return ExitCode::SUCCESS;
+}
+
+/// Map a boolean check result to an `Outcome`.
+fn outcome(ok: bool) -> Outcome {
+    return if ok { Outcome::Pass } else { Outcome::Fail };
 }
 
 /// Initialize a git working dir for the harness threads; fatal on setup failure.
+///
+/// # Errors
+/// Returns `Err(())` when the workdir cannot be created or its path is not UTF-8.
+///
+/// # Panics
+/// Does not panic.
 async fn setup_workdir() -> Result<String, ()> {
     let wd = temp_dir().join(format!("rh-{}", id()));
     if let Err(err) = create_dir_all(&wd) {

@@ -25,9 +25,9 @@ use futures::StreamExt as _;
 use futures::stream::Stream;
 use gemini_rust::tools::ToolConfig;
 use gemini_rust::{
-    Content, ContentBuilder, FinishReason, FunctionCall, FunctionDeclaration, FunctionResponse,
-    Gemini, GenerationStream, Model, Part, Role, ThinkingConfig, ThinkingLevel, Tool as GTool,
-    UsageMetadata,
+    Candidate, Content, ContentBuilder, FinishReason, FunctionCall, FunctionDeclaration,
+    FunctionResponse, Gemini, GenerationStream, Model, Part, Role, ThinkingConfig, ThinkingLevel,
+    Tool as GTool, UsageMetadata,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -176,6 +176,30 @@ struct CodexTool {
     #[serde(default)]
     parameters: Option<Value>,
 }
+/// Whether a finish reason has been observed on the stream.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum FinishObserved {
+    /// No finish reason seen yet.
+    No,
+    /// A finish reason was observed.
+    Yes,
+}
+/// Whether the assistant message output item is open.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum MsgOpen {
+    /// No message item open.
+    Closed,
+    /// A message item is open.
+    Open,
+}
+/// Whether the reasoning output item has been emitted.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum RsnEmitted {
+    /// Reasoning item not yet emitted.
+    No,
+    /// Reasoning item already emitted.
+    Yes,
+}
 /// Mutable accumulator threaded through the gemini stream loop.
 struct StreamState {
     /// Pending function calls (name, arguments).
@@ -183,13 +207,13 @@ struct StreamState {
     /// The observed finish reason.
     finish: Option<FinishReason>,
     /// Whether a finish reason was observed.
-    got_finish: bool,
+    got_finish: FinishObserved,
     /// The open message item id.
     msg_id: String,
     /// The open message output index.
     msg_oi: u32,
     /// Whether the assistant message item is open.
-    msg_open: bool,
+    msg_open: MsgOpen,
     /// Completed output items in emit order.
     out_items: Vec<OutputItem>,
     /// Next output index to assign.
@@ -197,7 +221,7 @@ struct StreamState {
     /// Accumulated reasoning text.
     reasoning: String,
     /// Whether the reasoning item was emitted.
-    rsn_emitted: bool,
+    rsn_emitted: RsnEmitted,
     /// Latest captured thought signature.
     rsn_sig: String,
     /// Monotonic SSE sequence number.
@@ -211,10 +235,40 @@ struct StreamState {
 /// Discard a value to satisfy must-use / non-binding-let lints without altering behavior.
 fn discard<T>(_value: T) {}
 
+impl StreamState {
+    /// Construct a zeroed accumulator at the start of a stream.
+    fn new() -> Self {
+        return Self {
+            seq: 0_u64,
+            text: String::new(),
+            reasoning: String::new(),
+            rsn_sig: String::new(),
+            out_items: Vec::new(),
+            fcs: Vec::new(),
+            usage: None,
+            got_finish: FinishObserved::No,
+            finish: None,
+            output_index: 0_u32,
+            rsn_emitted: RsnEmitted::No,
+            msg_open: MsgOpen::Closed,
+            msg_id: String::new(),
+            msg_oi: 0_u32,
+        };
+    }
+}
+
+/// Borrowed response identity (id + model) shared across every emitted event.
+#[derive(Clone, Copy)]
+struct RespMeta<'meta> {
+    /// The response id stamped on every event.
+    response_id: &'meta str,
+    /// The model id stamped on every event.
+    model: &'meta str,
+}
+
 /// Build the responses `Response` envelope shared across stream events.
 fn make_response(
-    response_id: &str,
-    model: &str,
+    meta: RespMeta<'_>,
     status: Status,
     output: Vec<OutputItem>,
     usage: Option<ResponseUsage>,
@@ -226,12 +280,12 @@ fn make_response(
         created_at: 0_u64,
         completed_at: None,
         error: None,
-        id: response_id.to_owned(),
+        id: meta.response_id.to_owned(),
         incomplete_details: None,
         instructions: None,
         max_output_tokens: None,
         metadata: None,
-        model: model.to_owned(),
+        model: meta.model.to_owned(),
         object: "response".into(),
         output,
         parallel_tool_calls: None,
@@ -296,6 +350,43 @@ fn push_message(contents: &mut Vec<Content>, role: &CodexRole, content: &[CodexC
     contents.push(Content::text(txt).with_role(mapped_role));
 }
 
+/// Push a prior function call (with its replayed thought signature) onto the contents.
+fn push_function_call(
+    contents: &mut Vec<Content>,
+    pending_sig: &mut Option<String>,
+    name: &str,
+    arguments: &str,
+) {
+    let args: Value = serde_json::from_str(arguments).unwrap_or_default();
+    let sig = pending_sig
+        .take()
+        .unwrap_or_else(|| return "skip_thought_signature_validator".into());
+    contents.push(
+        Content::function_call_with_thought(FunctionCall::new(name, args), sig)
+            .with_role(Role::Model),
+    );
+}
+
+/// Push a prior function-call output, keyed back to the call name, onto the contents.
+fn push_function_output(
+    contents: &mut Vec<Content>,
+    names: &HashMap<String, String>,
+    call_id: &str,
+    output: &str,
+) {
+    let name = names
+        .get(call_id)
+        .cloned()
+        .unwrap_or_else(|| return "unknown".into());
+    contents.push(
+        Content::function_response(FunctionResponse::new(
+            name,
+            serde_json::json!({ "output": output }),
+        ))
+        .with_role(Role::User),
+    );
+}
+
 /// Reconstruct the gemini contents vector from the codex per-turn input array.
 fn build_contents(req: &CodexReq) -> Vec<Content> {
     let mut names: HashMap<String, String> = HashMap::new();
@@ -313,7 +404,8 @@ fn build_contents(req: &CodexReq) -> Vec<Content> {
             }
             CodexInput::Reasoning { encrypted_content } => {
                 if let Some(enc) = encrypted_content
-                    && !enc.is_empty()
+                    .as_ref()
+                    .filter(|enc| return !enc.is_empty())
                 {
                     pending_sig = Some(enc.clone());
                 }
@@ -321,27 +413,10 @@ fn build_contents(req: &CodexReq) -> Vec<Content> {
             CodexInput::FunctionCall {
                 name, arguments, ..
             } => {
-                let args: Value = serde_json::from_str(arguments).unwrap_or_default();
-                let sig = pending_sig
-                    .take()
-                    .unwrap_or_else(|| return "skip_thought_signature_validator".into());
-                contents.push(
-                    Content::function_call_with_thought(FunctionCall::new(name, args), sig)
-                        .with_role(Role::Model),
-                );
+                push_function_call(&mut contents, &mut pending_sig, name, arguments);
             }
             CodexInput::FunctionCallOutput { call_id, output } => {
-                let name = names
-                    .get(call_id)
-                    .cloned()
-                    .unwrap_or_else(|| return "unknown".into());
-                contents.push(
-                    Content::function_response(FunctionResponse::new(
-                        name,
-                        serde_json::json!({ "output": output }),
-                    ))
-                    .with_role(Role::User),
-                );
+                push_function_output(&mut contents, &names, call_id, output);
             }
             CodexInput::Other => {}
         }
@@ -400,13 +475,12 @@ fn build_request(client: &Gemini, req: &CodexReq, contents: Vec<Content>) -> Con
 async fn emit_open(
     sender: &Sender<Result<Event, Infallible>>,
     state: &mut StreamState,
-    response_id: &str,
-    model: &str,
+    meta: RespMeta<'_>,
 ) -> bool {
     state.seq = state.seq.wrapping_add(1);
     let created = ResponseStreamEvent::ResponseCreated(ResponseCreatedEvent {
         sequence_number: state.seq,
-        response: make_response(response_id, model, Status::InProgress, vec![], None),
+        response: make_response(meta, Status::InProgress, vec![], None),
     });
     if sender.send(Ok(to_event(&created))).await.is_err() {
         return false;
@@ -414,7 +488,7 @@ async fn emit_open(
     state.seq = state.seq.wrapping_add(1);
     let in_progress = ResponseStreamEvent::ResponseInProgress(ResponseInProgressEvent {
         sequence_number: state.seq,
-        response: make_response(response_id, model, Status::InProgress, vec![], None),
+        response: make_response(meta, Status::InProgress, vec![], None),
     });
     return sender.send(Ok(to_event(&in_progress))).await.is_ok();
 }
@@ -424,10 +498,12 @@ async fn flush_reasoning(
     sender: &Sender<Result<Event, Infallible>>,
     state: &mut StreamState,
 ) -> bool {
-    if state.rsn_emitted || (state.reasoning.is_empty() && state.rsn_sig.is_empty()) {
+    if state.rsn_emitted == RsnEmitted::Yes
+        || (state.reasoning.is_empty() && state.rsn_sig.is_empty())
+    {
         return true;
     }
-    state.rsn_emitted = true;
+    state.rsn_emitted = RsnEmitted::Yes;
     let reasoning_item = ReasoningItem {
         id: Some(format!("rs_{}", Uuid::new_v4().simple())),
         summary: vec![SummaryPart::SummaryText(SummaryTextContent {
@@ -460,6 +536,28 @@ async fn flush_reasoning(
     return true;
 }
 
+/// Open a fresh assistant message item and emit its `output_item.added`; false if receiver closed.
+async fn open_message(sender: &Sender<Result<Event, Infallible>>, state: &mut StreamState) -> bool {
+    state.msg_open = MsgOpen::Open;
+    state.msg_oi = state.output_index;
+    state.output_index = state.output_index.wrapping_add(1);
+    state.msg_id = format!("msg_{}", Uuid::new_v4().simple());
+    let message = OutputMessage {
+        content: vec![],
+        id: state.msg_id.clone(),
+        role: AssistantRole::Assistant,
+        phase: None,
+        status: OutputStatus::InProgress,
+    };
+    state.seq = state.seq.wrapping_add(1);
+    let added = ResponseStreamEvent::ResponseOutputItemAdded(ResponseOutputItemAddedEvent {
+        sequence_number: state.seq,
+        output_index: state.msg_oi,
+        item: OutputItem::Message(message),
+    });
+    return sender.send(Ok(to_event(&added))).await.is_ok();
+}
+
 /// Handle a visible (non-thought) text part; returns false if the receiver closed.
 async fn emit_text_part(
     sender: &Sender<Result<Event, Infallible>>,
@@ -469,27 +567,8 @@ async fn emit_text_part(
     if !flush_reasoning(sender, state).await {
         return false;
     }
-    if !state.msg_open {
-        state.msg_open = true;
-        state.msg_oi = state.output_index;
-        state.output_index = state.output_index.wrapping_add(1);
-        state.msg_id = format!("msg_{}", Uuid::new_v4().simple());
-        let message = OutputMessage {
-            content: vec![],
-            id: state.msg_id.clone(),
-            role: AssistantRole::Assistant,
-            phase: None,
-            status: OutputStatus::InProgress,
-        };
-        state.seq = state.seq.wrapping_add(1);
-        let added = ResponseStreamEvent::ResponseOutputItemAdded(ResponseOutputItemAddedEvent {
-            sequence_number: state.seq,
-            output_index: state.msg_oi,
-            item: OutputItem::Message(message),
-        });
-        if sender.send(Ok(to_event(&added))).await.is_err() {
-            return false;
-        }
+    if state.msg_open == MsgOpen::Closed && !open_message(sender, state).await {
+        return false;
     }
     state.text.push_str(&part_text);
     state.seq = state.seq.wrapping_add(1);
@@ -502,6 +581,26 @@ async fn emit_text_part(
         logprobs: None,
     });
     return sender.send(Ok(to_event(&delta))).await.is_ok();
+}
+
+/// Queue a pending function call, capturing its signature; false if the receiver closed.
+async fn handle_function_call(
+    sender: &Sender<Result<Event, Infallible>>,
+    state: &mut StreamState,
+    function_call: FunctionCall,
+    thought_signature: Option<String>,
+) -> bool {
+    if let Some(signature) = thought_signature {
+        state.rsn_sig = signature;
+    }
+    if !flush_reasoning(sender, state).await {
+        return false;
+    }
+    state.fcs.push((
+        function_call.name,
+        serde_json::to_string(&function_call.args).unwrap_or_else(|_| return "{}".into()),
+    ));
+    return true;
 }
 
 /// Process one gemini part; returns false if the receiver closed.
@@ -531,17 +630,7 @@ async fn handle_part(
             function_call,
             thought_signature,
         } => {
-            if let Some(signature) = thought_signature {
-                state.rsn_sig = signature;
-            }
-            if !flush_reasoning(sender, state).await {
-                return false;
-            }
-            state.fcs.push((
-                function_call.name,
-                serde_json::to_string(&function_call.args).unwrap_or_else(|_| return "{}".into()),
-            ));
-            return true;
+            return handle_function_call(sender, state, function_call, thought_signature).await;
         }
         Part::Text { .. }
         | Part::InlineData { .. }
@@ -569,6 +658,24 @@ fn map_usage(meta: &UsageMetadata) -> ResponseUsage {
     };
 }
 
+/// Emit every part of one candidate, recording the finish reason; false if the receiver closed.
+async fn handle_candidate(
+    sender: &Sender<Result<Event, Infallible>>,
+    state: &mut StreamState,
+    candidate: Candidate,
+) -> bool {
+    for part in candidate.content.parts.unwrap_or_default() {
+        if !handle_part(sender, state, part).await {
+            return false;
+        }
+    }
+    if let Some(finish_reason) = candidate.finish_reason {
+        state.got_finish = FinishObserved::Yes;
+        state.finish = Some(finish_reason);
+    }
+    return true;
+}
+
 /// Consume the gemini stream into the accumulator; returns false if the receiver closed.
 async fn consume_stream(
     sender: &Sender<Result<Event, Infallible>>,
@@ -577,18 +684,10 @@ async fn consume_stream(
 ) -> bool {
     while let Some(item) = stream.next().await {
         let Ok(chunk) = item else { break };
-        if let Some(candidate) = chunk.candidates.into_iter().next() {
-            if let Some(parts) = candidate.content.parts {
-                for part in parts {
-                    if !handle_part(sender, state, part).await {
-                        return false;
-                    }
-                }
-            }
-            if let Some(finish_reason) = candidate.finish_reason {
-                state.got_finish = true;
-                state.finish = Some(finish_reason);
-            }
+        if let Some(candidate) = chunk.candidates.into_iter().next()
+            && !handle_candidate(sender, state, candidate).await
+        {
+            return false;
         }
         if let Some(meta) = &chunk.usage_metadata {
             state.usage = Some(map_usage(meta));
@@ -602,7 +701,7 @@ async fn close_message(
     sender: &Sender<Result<Event, Infallible>>,
     state: &mut StreamState,
 ) -> bool {
-    if !state.msg_open {
+    if state.msg_open == MsgOpen::Closed {
         return true;
     }
     let message = OutputMessage {
@@ -625,7 +724,7 @@ async fn close_message(
     if sender.send(Ok(to_event(&done))).await.is_err() {
         return false;
     }
-    let insert_at = if state.rsn_emitted {
+    let insert_at = if state.rsn_emitted == RsnEmitted::Yes {
         1_usize.min(state.out_items.len())
     } else {
         0_usize
@@ -634,6 +733,47 @@ async fn close_message(
         .out_items
         .insert(insert_at, OutputItem::Message(message));
     return true;
+}
+
+/// Build the four ordered SSE events one pending function call emits, bumping the sequence.
+fn function_call_events(
+    state: &mut StreamState,
+    function_call: &FunctionToolCall,
+    fc_id: &str,
+    args: String,
+) -> [ResponseStreamEvent; 4] {
+    state.seq = state.seq.wrapping_add(1);
+    let added = ResponseStreamEvent::ResponseOutputItemAdded(ResponseOutputItemAddedEvent {
+        sequence_number: state.seq,
+        output_index: state.output_index,
+        item: OutputItem::FunctionCall(function_call.clone()),
+    });
+    state.seq = state.seq.wrapping_add(1);
+    let delta = ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(
+        ResponseFunctionCallArgumentsDeltaEvent {
+            sequence_number: state.seq,
+            item_id: fc_id.to_owned(),
+            output_index: state.output_index,
+            delta: args.clone(),
+        },
+    );
+    state.seq = state.seq.wrapping_add(1);
+    let args_done = ResponseStreamEvent::ResponseFunctionCallArgumentsDone(
+        ResponseFunctionCallArgumentsDoneEvent {
+            name: None,
+            sequence_number: state.seq,
+            item_id: fc_id.to_owned(),
+            output_index: state.output_index,
+            arguments: args,
+        },
+    );
+    state.seq = state.seq.wrapping_add(1);
+    let item_done = ResponseStreamEvent::ResponseOutputItemDone(ResponseOutputItemDoneEvent {
+        sequence_number: state.seq,
+        output_index: state.output_index,
+        item: OutputItem::FunctionCall(function_call.clone()),
+    });
+    return [added, delta, args_done, item_done];
 }
 
 /// Emit the four events for one pending function call; returns false if the receiver closed.
@@ -652,48 +792,10 @@ async fn emit_function_call(
         id: Some(fc_id.clone()),
         status: Some(OutputStatus::Completed),
     };
-    state.seq = state.seq.wrapping_add(1);
-    let added = ResponseStreamEvent::ResponseOutputItemAdded(ResponseOutputItemAddedEvent {
-        sequence_number: state.seq,
-        output_index: state.output_index,
-        item: OutputItem::FunctionCall(function_call.clone()),
-    });
-    if sender.send(Ok(to_event(&added))).await.is_err() {
-        return false;
-    }
-    state.seq = state.seq.wrapping_add(1);
-    let delta = ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(
-        ResponseFunctionCallArgumentsDeltaEvent {
-            sequence_number: state.seq,
-            item_id: fc_id.clone(),
-            output_index: state.output_index,
-            delta: args.clone(),
-        },
-    );
-    if sender.send(Ok(to_event(&delta))).await.is_err() {
-        return false;
-    }
-    state.seq = state.seq.wrapping_add(1);
-    let args_done = ResponseStreamEvent::ResponseFunctionCallArgumentsDone(
-        ResponseFunctionCallArgumentsDoneEvent {
-            name: None,
-            sequence_number: state.seq,
-            item_id: fc_id,
-            output_index: state.output_index,
-            arguments: args,
-        },
-    );
-    if sender.send(Ok(to_event(&args_done))).await.is_err() {
-        return false;
-    }
-    state.seq = state.seq.wrapping_add(1);
-    let item_done = ResponseStreamEvent::ResponseOutputItemDone(ResponseOutputItemDoneEvent {
-        sequence_number: state.seq,
-        output_index: state.output_index,
-        item: OutputItem::FunctionCall(function_call.clone()),
-    });
-    if sender.send(Ok(to_event(&item_done))).await.is_err() {
-        return false;
+    for event in function_call_events(state, &function_call, &fc_id, args) {
+        if sender.send(Ok(to_event(&event))).await.is_err() {
+            return false;
+        }
     }
     state
         .out_items
@@ -729,22 +831,21 @@ const fn incomplete_reason(finish: Option<&FinishReason>) -> Option<&'static str
 async fn emit_terminal(
     sender: &Sender<Result<Event, Infallible>>,
     state: &mut StreamState,
-    response_id: &str,
-    model: &str,
+    meta: RespMeta<'_>,
 ) {
     let out_items = take(&mut state.out_items);
     let usage = state.usage.take();
-    if !state.got_finish {
+    if state.got_finish == FinishObserved::No {
         state.seq = state.seq.wrapping_add(1);
         let failed = ResponseStreamEvent::ResponseFailed(ResponseFailedEvent {
             sequence_number: state.seq,
-            response: make_response(response_id, model, Status::Failed, out_items, usage),
+            response: make_response(meta, Status::Failed, out_items, usage),
         });
         discard(sender.send(Ok(to_event(&failed))).await);
         return;
     }
     if let Some(reason) = incomplete_reason(state.finish.as_ref()) {
-        let mut resp = make_response(response_id, model, Status::Incomplete, out_items, usage);
+        let mut resp = make_response(meta, Status::Incomplete, out_items, usage);
         resp.incomplete_details = Some(IncompleteDetails {
             reason: reason.into(),
         });
@@ -759,65 +860,61 @@ async fn emit_terminal(
     state.seq = state.seq.wrapping_add(1);
     let completed = ResponseStreamEvent::ResponseCompleted(ResponseCompletedEvent {
         sequence_number: state.seq,
-        response: make_response(response_id, model, Status::Completed, out_items, usage),
+        response: make_response(meta, Status::Completed, out_items, usage),
     });
     discard(sender.send(Ok(to_event(&completed))).await);
+}
+
+/// Send a terminal `response.failed` carrying the given sequence number.
+async fn send_failed(
+    sender: &Sender<Result<Event, Infallible>>,
+    meta: RespMeta<'_>,
+    sequence_number: u64,
+) {
+    let failed = ResponseStreamEvent::ResponseFailed(ResponseFailedEvent {
+        sequence_number,
+        response: make_response(meta, Status::Failed, vec![], None),
+    });
+    discard(sender.send(Ok(to_event(&failed))).await);
+}
+
+/// Drain a live gemini stream into the typed responses event sequence.
+async fn drive_stream(
+    sender: &Sender<Result<Event, Infallible>>,
+    state: &mut StreamState,
+    stream: GenerationStream,
+    meta: RespMeta<'_>,
+) {
+    if !consume_stream(sender, state, stream).await
+        || !flush_reasoning(sender, state).await
+        || !close_message(sender, state).await
+    {
+        return;
+    }
+    for (name, args) in take(&mut state.fcs) {
+        if !emit_function_call(sender, state, name, args).await {
+            return;
+        }
+    }
+    emit_terminal(sender, state, meta).await;
 }
 
 /// Drive the gemini stream and emit the typed responses event sequence.
 async fn stream_responses(
     builder: ContentBuilder,
     sender: Sender<Result<Event, Infallible>>,
-    response_id: &str,
-    model: &str,
+    meta: RespMeta<'_>,
 ) {
-    let mut state = StreamState {
-        seq: 0_u64,
-        text: String::new(),
-        reasoning: String::new(),
-        rsn_sig: String::new(),
-        out_items: Vec::new(),
-        fcs: Vec::new(),
-        usage: None,
-        got_finish: false,
-        finish: None,
-        output_index: 0_u32,
-        rsn_emitted: false,
-        msg_open: false,
-        msg_id: String::new(),
-        msg_oi: 0_u32,
-    };
-
-    if !emit_open(&sender, &mut state, response_id, model).await {
+    let mut state = StreamState::new();
+    if !emit_open(&sender, &mut state, meta).await {
         return;
     }
-
     let Ok(stream) = builder.execute_stream().await else {
         state.seq = state.seq.wrapping_add(1);
-        let failed = ResponseStreamEvent::ResponseFailed(ResponseFailedEvent {
-            sequence_number: state.seq,
-            response: make_response(response_id, model, Status::Failed, vec![], None),
-        });
-        discard(sender.send(Ok(to_event(&failed))).await);
+        send_failed(&sender, meta, state.seq).await;
         return;
     };
-
-    if !consume_stream(&sender, &mut state, stream).await {
-        return;
-    }
-    if !flush_reasoning(&sender, &mut state).await {
-        return;
-    }
-    if !close_message(&sender, &mut state).await {
-        return;
-    }
-    let fcs = take(&mut state.fcs);
-    for (name, args) in fcs {
-        if !emit_function_call(&sender, &mut state, name, args).await {
-            return;
-        }
-    }
-    emit_terminal(&sender, &mut state, response_id, model).await;
+    Box::pin(drive_stream(&sender, &mut state, stream, meta)).await;
 }
 
 /// Codex `/v1/responses` handler: translate to gemini, stream typed responses events.
@@ -839,25 +936,32 @@ async fn responses(
     let response_id = format!("resp_{}", Uuid::new_v4().simple());
 
     let Ok(client) = Gemini::with_model(state.api_key, Model::Custom(api_model)) else {
-        discard(tokio::spawn(async move {
-            let response = make_response(&response_id, &model, Status::Failed, vec![], None);
-            let event = ResponseStreamEvent::ResponseFailed(ResponseFailedEvent {
-                sequence_number: 1_u64,
-                response,
-            });
-            discard(sender.send(Ok(to_event(&event))).await);
-        }));
+        discard(tokio::spawn(Box::pin(async move {
+            let meta = RespMeta {
+                response_id: &response_id,
+                model: &model,
+            };
+            send_failed(&sender, meta, 1_u64).await;
+        })));
         return Sse::new(ReceiverStream::new(receiver));
     };
     let builder = build_request(&client, &req, contents);
 
-    discard(tokio::spawn(async move {
-        stream_responses(builder, sender, &response_id, &model).await;
-    }));
+    discard(tokio::spawn(Box::pin(async move {
+        let meta = RespMeta {
+            response_id: &response_id,
+            model: &model,
+        };
+        stream_responses(builder, sender, meta).await;
+    })));
     return Sse::new(ReceiverStream::new(receiver));
 }
 
 /// Entry point: bind the bridge and serve.
+///
+/// # Panics
+///
+/// Panics if the tokio runtime fails to build or the bound server task panics.
 #[tokio::main]
 async fn main() {
     let Ok(api_key) = var("GEMINI_API_KEY") else {
