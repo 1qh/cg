@@ -159,10 +159,7 @@ async fn run() -> Result<(), ()> {
     init_repo(&work_dir).await;
 
     let Ok(port) = var("BRIDGE_PORT") else {
-        discard(writeln!(
-            stderr(),
-            "BRIDGE_PORT env required (no fallback)"
-        ));
+        discard(writeln!(stderr(), "BRIDGE_PORT env required (no fallback)"));
         return Err(());
     };
     let Ok(mut child) = spawn_codex(&port) else {
