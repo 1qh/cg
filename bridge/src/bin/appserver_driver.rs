@@ -4,60 +4,14 @@
 use serde_json::{json, Value};
 use std::env::{temp_dir, var};
 use std::fs::create_dir_all;
-use std::io::{stdout, Error as IoError, Write as _};
+use std::io::stdout;
+use std::io::Error as IoError;
+use std::io::Write as _;
 use std::path::Path;
-use std::process::{id as process_id, ExitCode, ExitStatus, Stdio};
+use std::process::id as process_id;
+use std::process::{ExitCode, ExitStatus, Stdio};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-
-/// Initialize a throwaway git repo in `work_dir` so codex treats it as a project root.
-async fn init_repo(work_dir: &Path) {
-    let _: Result<ExitStatus, IoError> = Command::new("git")
-        .args(["init", "-q"])
-        .current_dir(work_dir)
-        .status()
-        .await;
-    let _: Result<ExitStatus, IoError> = Command::new("git")
-        .args(["commit", "-q", "--allow-empty", "-m", "i"])
-        .current_dir(work_dir)
-        .env("GIT_AUTHOR_NAME", "x")
-        .env("GIT_AUTHOR_EMAIL", "a@b.c")
-        .env("GIT_COMMITTER_NAME", "x")
-        .env("GIT_COMMITTER_EMAIL", "a@b.c")
-        .status()
-        .await;
-}
-
-/// Spawn `codex app-server` wired to the BYOK provider on the bridge port.
-fn spawn_codex(port: &str) -> Result<Child, IoError> {
-    let base_url = format!("model_providers.r.base_url=\"http://localhost:{port}/v1\"");
-    Command::new("codex")
-        .args([
-            "app-server",
-            "-c",
-            "model_provider=r",
-            "-c",
-            "model_providers.r.name=\"r\"",
-            "-c",
-            &base_url,
-            "-c",
-            "model_providers.r.wire_api=\"responses\"",
-            "-c",
-            "model_providers.r.env_key=\"K\"",
-        ])
-        .env("K", "x")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-}
-
-/// Build one JSON-RPC request line and advance the request id counter.
-fn rpc_line(method: &str, params: Value, counter: &mut u64) -> String {
-    let line = format!("{}\n", json!({"method": method, "id": *counter, "params": params}));
-    *counter = (*counter).wrapping_add(1);
-    line
-}
 
 /// Outcome of driving the app-server: whether the turn finished and the captured reply.
 struct DriveOutcome {
@@ -66,6 +20,9 @@ struct DriveOutcome {
     /// The captured agent message text.
     msg: String,
 }
+
+/// Consume a value, suppressing the result. Why: kills let_underscore + unused_results lints.
+fn discard<T>(_value: T) {}
 
 /// Drive the JSON-RPC loop: reply to server requests, start a thread, start a turn, capture the message.
 async fn drive(
@@ -145,7 +102,36 @@ async fn drive(
             break;
         }
     }
-    DriveOutcome { done, msg }
+    return DriveOutcome { done, msg };
+}
+
+/// Initialize a throwaway git repo in `work_dir` so codex treats it as a project root.
+async fn init_repo(work_dir: &Path) {
+    discard(
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(work_dir)
+            .status()
+            .await,
+    );
+    discard(
+        Command::new("git")
+            .args(["commit", "-q", "--allow-empty", "-m", "i"])
+            .current_dir(work_dir)
+            .env("GIT_AUTHOR_NAME", "x")
+            .env("GIT_AUTHOR_EMAIL", "a@b.c")
+            .env("GIT_COMMITTER_NAME", "x")
+            .env("GIT_COMMITTER_EMAIL", "a@b.c")
+            .status()
+            .await,
+    );
+}
+
+/// Build one JSON-RPC request line and advance the request id counter.
+fn rpc_line(method: &str, params: Value, counter: &mut u64) -> String {
+    let line = format!("{}\n", json!({"method": method, "id": *counter, "params": params}));
+    *counter = (*counter).wrapping_add(1);
+    return line;
 }
 
 /// Run the spike: spawn codex app-server, drive it, print the proof line; `Err` signals a setup failure.
@@ -181,14 +167,14 @@ async fn run() -> Result<(), ()> {
     };
 
     let outcome = drive(&mut stdin, &mut lines, &work_dir, &mut counter).await;
-    let _: Result<(), IoError> = child.kill().await;
+    discard(child.kill().await);
     let done = outcome.done;
     let msg = outcome.msg;
-    let _: Result<(), IoError> = writeln!(
+    discard(writeln!(
         stdout(),
         "  pure-Rust driver: done={done} reply={msg:?}"
-    );
-    let _: Result<(), IoError> = writeln!(
+    ));
+    discard(writeln!(
         stdout(),
         "  >> {}",
         if done && msg.contains("PURE_RUST_DRIVER_OK") {
@@ -196,15 +182,39 @@ async fn run() -> Result<(), ()> {
         } else {
             "see above"
         }
-    );
-    Ok(())
+    ));
+    return Ok(());
+}
+
+/// Spawn `codex app-server` wired to the BYOK provider on the bridge port.
+fn spawn_codex(port: &str) -> Result<Child, IoError> {
+    let base_url = format!("model_providers.r.base_url=\"http://localhost:{port}/v1\"");
+    return Command::new("codex")
+        .args([
+            "app-server",
+            "-c",
+            "model_provider=r",
+            "-c",
+            "model_providers.r.name=\"r\"",
+            "-c",
+            &base_url,
+            "-c",
+            "model_providers.r.wire_api=\"responses\"",
+            "-c",
+            "model_providers.r.env_key=\"K\"",
+        ])
+        .env("K", "x")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn();
 }
 
 /// Spike entry point: delegate to `run`, mapping a setup failure to a non-zero exit code.
 #[tokio::main]
 async fn main() -> ExitCode {
-    match run().await {
+    return match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(()) => ExitCode::FAILURE,
-    }
+    };
 }

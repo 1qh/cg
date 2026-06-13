@@ -1,10 +1,130 @@
 //! SPIKE: pure-Rust comprehensive verify harness (Node harness-live.mjs equivalent) — proves the
 //! can-fail suite ports to Rust with ZERO LOSE. Runs key checks against the bridge, same as Node.
-use serde_json::{json, Value};
-use std::io::Write as _;
-use std::process::{ExitCode, Stdio};
+use serde_json::{Value, json};
+use std::env::{temp_dir, var};
+use std::fs::create_dir_all;
+use std::io::{Write as _, stderr, stdout};
+use std::process::{ExitCode, Stdio, id};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, Command};
+
+/// Swallow a value, marking it intentionally unused.
+fn discard<T>(_value: T) {}
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    let Ok(wds) = setup_workdir().await else {
+        return ExitCode::FAILURE;
+    };
+    let mut checker = Checker { pass: 0, total: 0 };
+
+    let Ok(mut session) = Session::new(&wds, "workspace-write").await else {
+        return ExitCode::FAILURE;
+    };
+    let tid = session.start_thread("workspace-write").await;
+    let (m1, _, r1) = session
+        .turn(
+            &tid,
+            "Think step by step why 17 is prime, then reply with exactly ALPHA_OK.",
+        )
+        .await;
+    checker.check(
+        "turn completes + message",
+        m1.contains("ALPHA_OK"),
+        &format!("({})", &m1.chars().take(20).collect::<String>()),
+    );
+    checker.check("reasoning surfaces", r1 > 0, &format!("({r1} items)"));
+    let (m2, sh2, _) = session
+        .turn(&tid, "Run a shell command that prints exactly SHELL_OK_42.")
+        .await;
+    checker.check("shell tool executes", sh2 > 0, &format!("({sh2})"));
+    checker.check(
+        "shell output reported",
+        m2.contains("SHELL_OK_42") || sh2 > 0,
+        "",
+    );
+    discard(session.turn(&tid, "Remember the number 31337.").await);
+    let (m4, _, _) = session
+        .turn(
+            &tid,
+            "What number did I ask you to remember? Reply with just the number.",
+        )
+        .await;
+    checker.check(
+        "multi-turn continuity",
+        m4.contains("31337"),
+        &format!("({})", &m4.chars().take(20).collect::<String>()),
+    );
+    discard(session.child.kill().await);
+    let pass = checker.pass;
+    let total = checker.total;
+    discard(writeln!(
+        stdout(),
+        "\n  pure-Rust harness: {pass}/{total} checks"
+    ));
+    discard(writeln!(
+        stdout(),
+        "  >> {}",
+        if pass == total {
+            "PROVEN \u{2014} pure-Rust harness runs the capability checks GREEN (verify suite ports to Rust, zero lose)"
+        } else {
+            "see failures"
+        }
+    ));
+    return ExitCode::SUCCESS;
+}
+
+/// Initialize a git working dir for the harness threads; fatal on setup failure.
+async fn setup_workdir() -> Result<String, ()> {
+    let wd = temp_dir().join(format!("rh-{}", id()));
+    if let Err(err) = create_dir_all(&wd) {
+        discard(writeln!(stderr(), "create workdir failed: {err}"));
+        return Err(());
+    }
+    discard(
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&wd)
+            .status()
+            .await,
+    );
+    discard(
+        Command::new("git")
+            .args(["commit", "-q", "--allow-empty", "-m", "i"])
+            .current_dir(&wd)
+            .env("GIT_AUTHOR_NAME", "x")
+            .env("GIT_AUTHOR_EMAIL", "a@b.c")
+            .env("GIT_COMMITTER_NAME", "x")
+            .env("GIT_COMMITTER_EMAIL", "a@b.c")
+            .status()
+            .await,
+    );
+    let Some(wds) = wd.to_str() else {
+        discard(writeln!(stderr(), "workdir path not utf-8"));
+        return Err(());
+    };
+    return Ok(wds.to_owned());
+}
+
+/// Aggregates pass/total counts and prints one PASS/FAIL line per check.
+struct Checker {
+    /// Number of checks that passed.
+    pass: u32,
+    /// Total number of checks run.
+    total: u32,
+}
+
+/// Outcome of one `rpc` call: agent message text, shell-call count, reasoning-item count, thread id.
+struct RpcOut {
+    /// Accumulated agent message text.
+    msg: String,
+    /// Number of shell/command items observed.
+    shell: u32,
+    /// Number of reasoning items observed.
+    reasoning: u32,
+    /// Thread id captured from a result, when present.
+    tid: String,
+}
 
 /// One driven codex `app-server` session over JSON-RPC on stdio.
 struct Session {
@@ -20,24 +140,29 @@ struct Session {
     wd: String,
 }
 
-/// Outcome of one `rpc` call: agent message text, shell-call count, reasoning-item count, thread id.
-struct RpcOut {
-    /// Accumulated agent message text.
-    msg: String,
-    /// Number of shell/command items observed.
-    shell: u32,
-    /// Number of reasoning items observed.
-    reasoning: u32,
-    /// Thread id captured from a result, when present.
-    tid: String,
+impl Checker {
+    /// Record one check outcome and print its result line.
+    fn check(&mut self, name: &str, ok: bool, detail: &str) {
+        self.total = self.total.wrapping_add(1);
+        if ok {
+            self.pass = self.pass.wrapping_add(1);
+        }
+        discard(writeln!(
+            stdout(),
+            "  {} {} {}",
+            if ok { "PASS" } else { "FAIL" },
+            name,
+            detail
+        ));
+    }
 }
 
 impl Session {
     /// Spawn `codex app-server` against the local bridge and run `initialize`.
-    async fn new(wd: &str, sandbox: &str) -> Self {
-        let Ok(port) = std::env::var("BRIDGE_PORT") else {
-            let _ = writeln!(std::io::stderr(), "BRIDGE_PORT env required (no fallback)");
-            std::process::exit(1);
+    async fn new(wd: &str, sandbox: &str) -> Result<Self, ()> {
+        let Ok(port) = var("BRIDGE_PORT") else {
+            discard(writeln!(stderr(), "BRIDGE_PORT env required (no fallback)"));
+            return Err(());
         };
         let base_url = format!("model_providers.r.base_url=\"http://localhost:{port}/v1\"");
         let spawned = Command::new("codex")
@@ -62,17 +187,17 @@ impl Session {
         let mut child = match spawned {
             Ok(spawned_child) => spawned_child,
             Err(err) => {
-                let _ = writeln!(std::io::stderr(), "spawn codex failed: {err}");
-                std::process::exit(1);
+                discard(writeln!(stderr(), "spawn codex failed: {err}"));
+                return Err(());
             }
         };
         let Some(stdin) = child.stdin.take() else {
-            let _ = writeln!(std::io::stderr(), "child stdin unavailable");
-            std::process::exit(1);
+            discard(writeln!(stderr(), "child stdin unavailable"));
+            return Err(());
         };
         let Some(stdout) = child.stdout.take() else {
-            let _ = writeln!(std::io::stderr(), "child stdout unavailable");
-            std::process::exit(1);
+            discard(writeln!(stderr(), "child stdout unavailable"));
+            return Err(());
         };
         let lines = BufReader::new(stdout).lines();
         let mut session = Self {
@@ -82,15 +207,17 @@ impl Session {
             id: 1,
             wd: wd.into(),
         };
-        let _ = session
-            .rpc(
-                "initialize",
-                json!({"clientInfo":{"name":"x","version":"0"},"capabilities":null}),
-                false,
-                sandbox,
-            )
-            .await;
-        return session;
+        discard(
+            session
+                .rpc(
+                    "initialize",
+                    json!({"clientInfo":{"name":"x","version":"0"},"capabilities":null}),
+                    false,
+                    sandbox,
+                )
+                .await,
+        );
+        return Ok(session);
     }
     /// Send one JSON-RPC request, drain responses, and summarize the turn.
     async fn rpc(&mut self, method: &str, params: Value, is_turn: bool, sandbox: &str) -> RpcOut {
@@ -98,11 +225,16 @@ impl Session {
         self.id = self.id.wrapping_add(1);
         let line = format!("{}\n", json!({"method":method,"id":myid,"params":params}));
         if let Err(err) = self.stdin.write_all(line.as_bytes()).await {
-            let _ = writeln!(std::io::stderr(), "stdin write failed: {err}");
-            std::process::exit(1);
+            discard(writeln!(stderr(), "stdin write failed: {err}"));
+            return RpcOut {
+                msg: String::new(),
+                shell: 0_u32,
+                reasoning: 0_u32,
+                tid: String::new(),
+            };
         }
         let (mut msg, mut shell, mut reasoning, mut tid) =
-            (String::new(), 0u32, 0u32, String::new());
+            (String::new(), 0_u32, 0_u32, String::new());
         let mut result_seen = false;
         while let Ok(Some(line)) = self.lines.next_line().await {
             let line = line.trim().to_owned();
@@ -114,10 +246,15 @@ impl Session {
                 Err(_) => continue,
             };
             if msg_value.get("id").is_some() && msg_value.get("method").is_some() {
-                let ack = format!("{}\n", json!({"id":msg_value["id"],"result":{}}));
+                let ack = format!("{}\n", json!({"id":msg_value.get("id"),"result":{}}));
                 if let Err(err) = self.stdin.write_all(ack.as_bytes()).await {
-                    let _ = writeln!(std::io::stderr(), "stdin ack write failed: {err}");
-                    std::process::exit(1);
+                    discard(writeln!(stderr(), "stdin ack write failed: {err}"));
+                    return RpcOut {
+                        msg,
+                        shell,
+                        reasoning,
+                        tid,
+                    };
                 }
                 continue;
             }
@@ -132,7 +269,7 @@ impl Session {
                     .to_owned();
                 result_seen = true;
                 if !is_turn {
-                    let _ = sandbox;
+                    discard(sandbox);
                     break;
                 }
             }
@@ -151,10 +288,10 @@ impl Session {
                         _ => {}
                     }
                 }
-                if method == "item/agentMessage/delta" {
-                    if let Some(delta) = msg_value.pointer("/params/delta").and_then(Value::as_str) {
-                        msg.push_str(delta);
-                    }
+                if method == "item/agentMessage/delta"
+                    && let Some(delta) = msg_value.pointer("/params/delta").and_then(Value::as_str)
+                {
+                    msg.push_str(delta);
                 }
                 if (method == "turn/completed" || method == "turn/failed") && is_turn {
                     break;
@@ -187,116 +324,4 @@ impl Session {
             .await;
         return (out.msg, out.shell, out.reasoning);
     }
-}
-
-/// Aggregates pass/total counts and prints one PASS/FAIL line per check.
-struct Checker {
-    /// Number of checks that passed.
-    pass: u32,
-    /// Total number of checks run.
-    total: u32,
-}
-
-impl Checker {
-    /// Record one check outcome and print its result line.
-    fn check(&mut self, name: &str, ok: bool, detail: &str) {
-        self.total = self.total.wrapping_add(1);
-        if ok {
-            self.pass = self.pass.wrapping_add(1);
-        }
-        let _ = writeln!(
-            std::io::stdout(),
-            "  {} {} {}",
-            if ok { "PASS" } else { "FAIL" },
-            name,
-            detail
-        );
-    }
-}
-
-/// Initialize a git working dir for the harness threads; fatal on setup failure.
-async fn setup_workdir() -> String {
-    let wd = std::env::temp_dir().join(format!("rh-{}", std::process::id()));
-    if let Err(err) = std::fs::create_dir_all(&wd) {
-        let _ = writeln!(std::io::stderr(), "create workdir failed: {err}");
-        std::process::exit(1);
-    }
-    let _ = Command::new("git")
-        .args(["init", "-q"])
-        .current_dir(&wd)
-        .status()
-        .await;
-    let _ = Command::new("git")
-        .args(["commit", "-q", "--allow-empty", "-m", "i"])
-        .current_dir(&wd)
-        .env("GIT_AUTHOR_NAME", "x")
-        .env("GIT_AUTHOR_EMAIL", "a@b.c")
-        .env("GIT_COMMITTER_NAME", "x")
-        .env("GIT_COMMITTER_EMAIL", "a@b.c")
-        .status()
-        .await;
-    let Some(wds) = wd.to_str() else {
-        let _ = writeln!(std::io::stderr(), "workdir path not utf-8");
-        std::process::exit(1);
-    };
-    return wds.to_owned();
-}
-
-#[tokio::main]
-async fn main() -> ExitCode {
-    let wds = setup_workdir().await;
-    let mut checker = Checker { pass: 0, total: 0 };
-
-    let mut session = Session::new(&wds, "workspace-write").await;
-    let tid = session.start_thread("workspace-write").await;
-    let (m1, _, r1) = session
-        .turn(
-            &tid,
-            "Think step by step why 17 is prime, then reply with exactly ALPHA_OK.",
-        )
-        .await;
-    checker.check(
-        "turn completes + message",
-        m1.contains("ALPHA_OK"),
-        &format!("({})", &m1.chars().take(20).collect::<String>()),
-    );
-    checker.check("reasoning surfaces", r1 > 0, &format!("({r1} items)"));
-    let (m2, sh2, _) = session
-        .turn(&tid, "Run a shell command that prints exactly SHELL_OK_42.")
-        .await;
-    checker.check("shell tool executes", sh2 > 0, &format!("({sh2})"));
-    checker.check(
-        "shell output reported",
-        m2.contains("SHELL_OK_42") || sh2 > 0,
-        "",
-    );
-    let _ = session.turn(&tid, "Remember the number 31337.").await;
-    let (m4, _, _) = session
-        .turn(
-            &tid,
-            "What number did I ask you to remember? Reply with just the number.",
-        )
-        .await;
-    checker.check(
-        "multi-turn continuity",
-        m4.contains("31337"),
-        &format!("({})", &m4.chars().take(20).collect::<String>()),
-    );
-    let _ = session.child.kill().await;
-    let pass = checker.pass;
-    let total = checker.total;
-    let _ = writeln!(
-        std::io::stdout(),
-        "\n  pure-Rust harness: {pass}/{total} checks"
-    );
-    let _ = writeln!(
-        std::io::stdout(),
-        "  >> {}",
-        if pass == total {
-            "PROVEN \u{2014} pure-Rust harness runs the capability checks GREEN (verify suite ports to Rust, zero lose)"
-        } else {
-            "see failures"
-        }
-    );
-    return ExitCode::SUCCESS;
 }
