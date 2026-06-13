@@ -260,10 +260,10 @@ impl StreamState {
 /// Borrowed response identity (id + model) shared across every emitted event.
 #[derive(Clone, Copy)]
 struct RespMeta<'meta> {
-    /// The response id stamped on every event.
-    response_id: &'meta str,
     /// The model id stamped on every event.
     model: &'meta str,
+    /// The response id stamped on every event.
+    response_id: &'meta str,
 }
 
 /// Build the responses `Response` envelope shared across stream events.
@@ -915,7 +915,7 @@ async fn stream_responses(
     if !emit_open(&sender, &mut state, meta).await {
         return;
     }
-    let Ok(stream) = builder.execute_stream().await else {
+    let Ok(stream) = Box::pin(builder.execute_stream()).await else {
         state.seq = state.seq.wrapping_add(1);
         send_failed(&sender, meta, state.seq).await;
         return;
@@ -944,8 +944,8 @@ async fn responses(
     let Ok(client) = Gemini::with_model(state.api_key, Model::Custom(api_model)) else {
         discard(tokio::spawn(Box::pin(async move {
             let meta = RespMeta {
-                response_id: &response_id,
                 model: &model,
+                response_id: &response_id,
             };
             send_failed(&sender, meta, 1_u64).await;
         })));
@@ -955,10 +955,10 @@ async fn responses(
 
     discard(tokio::spawn(Box::pin(async move {
         let meta = RespMeta {
-            response_id: &response_id,
             model: &model,
+            response_id: &response_id,
         };
-        stream_responses(builder, sender, meta).await;
+        Box::pin(stream_responses(builder, sender, meta)).await;
     })));
     return Sse::new(ReceiverStream::new(receiver));
 }

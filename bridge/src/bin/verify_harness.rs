@@ -25,10 +25,6 @@ enum Outcome {
 }
 
 impl Outcome {
-    /// Pass when the predicate holds, otherwise fail.
-    const fn from_bool(passed: bool) -> Self {
-        return if passed { Self::Pass } else { Self::Fail };
-    }
     /// The label printed for this outcome.
     const fn label(self) -> &'static str {
         return if self.passed() { "PASS" } else { "FAIL" };
@@ -438,12 +434,16 @@ async fn check_reasoning(session: &mut Session, checker: &mut Checker, tid: &str
         .await;
     checker.check(
         "turn completes + message",
-        Outcome::from_bool(m1.contains("ALPHA_OK")),
+        if m1.contains("ALPHA_OK") {
+            Outcome::Pass
+        } else {
+            Outcome::Fail
+        },
         &format!("({})", &m1.chars().take(20).collect::<String>()),
     );
     checker.check(
         "reasoning surfaces",
-        Outcome::from_bool(r1 > 0),
+        if r1 > 0 { Outcome::Pass } else { Outcome::Fail },
         &format!("({r1} items)"),
     );
 }
@@ -455,12 +455,20 @@ async fn check_shell(session: &mut Session, checker: &mut Checker, tid: &str) {
         .await;
     checker.check(
         "shell tool executes",
-        Outcome::from_bool(sh2 > 0),
+        if sh2 > 0 {
+            Outcome::Pass
+        } else {
+            Outcome::Fail
+        },
         &format!("({sh2})"),
     );
     checker.check(
         "shell output reported",
-        Outcome::from_bool(m2.contains("SHELL_OK_42") || sh2 > 0),
+        if m2.contains("SHELL_OK_42") || sh2 > 0 {
+            Outcome::Pass
+        } else {
+            Outcome::Fail
+        },
         "",
     );
 }
@@ -476,7 +484,11 @@ async fn check_memory(session: &mut Session, checker: &mut Checker, tid: &str) {
         .await;
     checker.check(
         "multi-turn continuity",
-        Outcome::from_bool(m4.contains("31337")),
+        if m4.contains("31337") {
+            Outcome::Pass
+        } else {
+            Outcome::Fail
+        },
         &format!("({})", &m4.chars().take(20).collect::<String>()),
     );
 }
