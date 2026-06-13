@@ -624,13 +624,19 @@ async fn handle_part(
         Part::Text {
             text: part_text, ..
         } if !part_text.is_empty() => {
-            return emit_text_part(sender, state, part_text).await;
+            return Box::pin(emit_text_part(sender, state, part_text)).await;
         }
         Part::FunctionCall {
             function_call,
             thought_signature,
         } => {
-            return handle_function_call(sender, state, function_call, thought_signature).await;
+            return Box::pin(handle_function_call(
+                sender,
+                state,
+                function_call,
+                thought_signature,
+            ))
+            .await;
         }
         Part::Text { .. }
         | Part::InlineData { .. }
@@ -665,7 +671,7 @@ async fn handle_candidate(
     candidate: Candidate,
 ) -> bool {
     for part in candidate.content.parts.unwrap_or_default() {
-        if !handle_part(sender, state, part).await {
+        if !Box::pin(handle_part(sender, state, part)).await {
             return false;
         }
     }
@@ -685,7 +691,7 @@ async fn consume_stream(
     while let Some(item) = stream.next().await {
         let Ok(chunk) = item else { break };
         if let Some(candidate) = chunk.candidates.into_iter().next()
-            && !handle_candidate(sender, state, candidate).await
+            && !Box::pin(handle_candidate(sender, state, candidate)).await
         {
             return false;
         }
@@ -885,14 +891,14 @@ async fn drive_stream(
     stream: GenerationStream,
     meta: RespMeta<'_>,
 ) {
-    if !consume_stream(sender, state, stream).await
+    if !Box::pin(consume_stream(sender, state, stream)).await
         || !flush_reasoning(sender, state).await
         || !close_message(sender, state).await
     {
         return;
     }
     for (name, args) in take(&mut state.fcs) {
-        if !emit_function_call(sender, state, name, args).await {
+        if !Box::pin(emit_function_call(sender, state, name, args)).await {
             return;
         }
     }

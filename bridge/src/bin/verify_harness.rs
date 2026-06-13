@@ -25,13 +25,17 @@ enum Outcome {
 }
 
 impl Outcome {
+    /// Pass when the predicate holds, otherwise fail.
+    const fn from_bool(passed: bool) -> Self {
+        return if passed { Self::Pass } else { Self::Fail };
+    }
+    /// The label printed for this outcome.
+    const fn label(self) -> &'static str {
+        return if self.passed() { "PASS" } else { "FAIL" };
+    }
     /// True when this outcome is a pass.
     const fn passed(self) -> bool {
         return matches!(self, Self::Pass);
-    }
-    /// The label printed for this outcome.
-    fn label(self) -> &'static str {
-        return if self.passed() { "PASS" } else { "FAIL" };
     }
 }
 
@@ -53,12 +57,12 @@ impl RpcKind {
 
 /// Inputs for one `rpc` call: method, params, kind, and the sandbox policy.
 struct RpcCall<'call> {
+    /// Whether this is a turn-style or plain rpc.
+    kind: RpcKind,
     /// JSON-RPC method name.
     method: &'call str,
     /// JSON-RPC params payload.
     params: Value,
-    /// Whether this is a turn-style or plain rpc.
-    kind: RpcKind,
     /// Sandbox policy passed through for thread-bound calls.
     sandbox: &'call str,
 }
@@ -114,7 +118,44 @@ impl Checker {
     }
 }
 
+/// Control signal returned by one drained line: keep draining, finish, or abort.
+enum Flow {
+    /// A write failed; abort and return what we have.
+    Abort,
+    /// Keep reading further lines.
+    Continue,
+    /// The turn or plain rpc concluded; stop draining.
+    Done,
+}
+
 impl Session {
+    /// Acknowledge a server-initiated request by echoing its id with an empty result.
+    ///
+    /// # Errors
+    /// Returns `Err(())` when the stdin write fails.
+    async fn ack(&mut self, msg_value: &Value) -> Result<(), ()> {
+        let ack = format!("{}\n", json!({"id":msg_value.get("id"),"result":{}}));
+        if let Err(err) = self.stdin.write_all(ack.as_bytes()).await {
+            discard(writeln!(stderr(), "stdin ack write failed: {err}"));
+            return Err(());
+        }
+        return Ok(());
+    }
+    /// Drain responses for request `myid` until the turn or plain rpc concludes.
+    async fn drain(&mut self, myid: u64, kind: RpcKind, sandbox: &str) -> RpcOut {
+        let mut out = RpcOut::empty();
+        let mut result_seen = false;
+        while let Ok(Some(raw_line)) = self.lines.next_line().await {
+            let flow = self
+                .step(&raw_line, myid, kind, sandbox, &mut out, &mut result_seen)
+                .await;
+            match flow {
+                Flow::Continue => {}
+                Flow::Done | Flow::Abort => break,
+            }
+        }
+        return out;
+    }
     /// Spawn `codex app-server` against the local bridge and run `initialize`.
     ///
     /// # Errors
@@ -146,14 +187,28 @@ impl Session {
         discard(
             session
                 .rpc(RpcCall {
+                    kind: RpcKind::Plain,
                     method: "initialize",
                     params: json!({"clientInfo":{"name":"x","version":"0"},"capabilities":null}),
-                    kind: RpcKind::Plain,
                     sandbox,
                 })
                 .await,
         );
         return Ok(session);
+    }
+    /// Send one JSON-RPC request, drain responses, and summarize the turn.
+    async fn rpc(&mut self, call: RpcCall<'_>) -> RpcOut {
+        let myid = self.id;
+        self.id = self.id.wrapping_add(1);
+        let request_line = format!(
+            "{}\n",
+            json!({"method":call.method,"id":myid,"params":call.params})
+        );
+        if let Err(err) = self.stdin.write_all(request_line.as_bytes()).await {
+            discard(writeln!(stderr(), "stdin write failed: {err}"));
+            return RpcOut::empty();
+        }
+        return self.drain(myid, call.kind, call.sandbox).await;
     }
     /// Spawn the `codex app-server` child wired at the given bridge port.
     ///
@@ -188,83 +243,56 @@ impl Session {
             }
         };
     }
-    /// Send one JSON-RPC request, drain responses, and summarize the turn.
-    async fn rpc(&mut self, call: RpcCall<'_>) -> RpcOut {
-        let myid = self.id;
-        self.id = self.id.wrapping_add(1);
-        let request_line = format!(
-            "{}\n",
-            json!({"method":call.method,"id":myid,"params":call.params})
-        );
-        if let Err(err) = self.stdin.write_all(request_line.as_bytes()).await {
-            discard(writeln!(stderr(), "stdin write failed: {err}"));
-            return RpcOut::empty();
-        }
-        return self.drain(myid, call.kind, call.sandbox).await;
-    }
-    /// Drain responses for request `myid` until the turn or plain rpc concludes.
-    async fn drain(&mut self, myid: u64, kind: RpcKind, sandbox: &str) -> RpcOut {
-        let mut out = RpcOut::empty();
-        let mut result_seen = false;
-        while let Ok(Some(raw_line)) = self.lines.next_line().await {
-            let trimmed = raw_line.trim().to_owned();
-            let Some(msg_value) = parse_line(&trimmed) else {
-                continue;
-            };
-            if is_server_request(&msg_value) {
-                if self.ack(&msg_value).await.is_err() {
-                    return out;
-                }
-                continue;
-            }
-            if matches_result(&msg_value, myid) {
-                out.tid = read_thread_id(&msg_value);
-                result_seen = true;
-                if !kind.is_turn() {
-                    discard(sandbox);
-                    break;
-                }
-            }
-            if apply_event(&msg_value, kind, &mut out) {
-                break;
-            }
-            if result_seen && !kind.is_turn() {
-                break;
-            }
-        }
-        return out;
-    }
-    /// Acknowledge a server-initiated request by echoing its id with an empty result.
-    ///
-    /// # Errors
-    /// Returns `Err(())` when the stdin write fails.
-    async fn ack(&mut self, msg_value: &Value) -> Result<(), ()> {
-        let ack = format!("{}\n", json!({"id":msg_value.get("id"),"result":{}}));
-        if let Err(err) = self.stdin.write_all(ack.as_bytes()).await {
-            discard(writeln!(stderr(), "stdin ack write failed: {err}"));
-            return Err(());
-        }
-        return Ok(());
-    }
     /// Start a new thread bound to the BYOK model and return its thread id.
     async fn start_thread(&mut self, sandbox: &str) -> String {
         return self
             .rpc(RpcCall {
+                kind: RpcKind::Plain,
                 method: "thread/start",
                 params: json!({"model":"gemini-3.5-flash","modelProvider":"r","cwd":self.wd,"approvalPolicy":"never","sandbox":sandbox}),
-                kind: RpcKind::Plain,
                 sandbox,
             })
             .await
             .tid;
     }
+    /// Process one drained line and fold its effect into the accumulator.
+    async fn step(
+        &mut self,
+        raw_line: &str,
+        myid: u64,
+        kind: RpcKind,
+        sandbox: &str,
+        out: &mut RpcOut,
+        result_seen: &mut bool,
+    ) -> Flow {
+        let trimmed = raw_line.trim().to_owned();
+        let Some(msg_value) = parse_line(&trimmed) else {
+            return Flow::Continue;
+        };
+        if is_server_request(&msg_value) {
+            return match self.ack(&msg_value).await {
+                Ok(()) => Flow::Continue,
+                Err(()) => Flow::Abort,
+            };
+        }
+        if record_result(&msg_value, myid, kind, sandbox, out, result_seen) {
+            return Flow::Done;
+        }
+        if apply_event(&msg_value, kind, out) {
+            return Flow::Done;
+        }
+        if *result_seen && !kind.is_turn() {
+            return Flow::Done;
+        }
+        return Flow::Continue;
+    }
     /// Run one turn with the given text input and return message + shell + reasoning counts.
     async fn turn(&mut self, tid: &str, text: &str) -> (String, u32, u32) {
         let out = self
             .rpc(RpcCall {
+                kind: RpcKind::Turn,
                 method: "turn/start",
                 params: json!({"threadId":tid,"input":[{"type":"text","text":text,"text_elements":[]}]}),
-                kind: RpcKind::Turn,
                 sandbox: "",
             })
             .await;
@@ -274,7 +302,7 @@ impl Session {
 
 impl RpcOut {
     /// An empty result with zeroed counters and blank strings.
-    fn empty() -> Self {
+    const fn empty() -> Self {
         return Self {
             msg: String::new(),
             reasoning: 0_u32,
@@ -303,15 +331,36 @@ fn matches_result(msg_value: &Value, myid: u64) -> bool {
         && msg_value.get("result").is_some();
 }
 
+/// Capture the thread id from a matching result and report whether a plain rpc should stop.
+fn record_result(
+    msg_value: &Value,
+    myid: u64,
+    kind: RpcKind,
+    sandbox: &str,
+    out: &mut RpcOut,
+    result_seen: &mut bool,
+) -> bool {
+    if !matches_result(msg_value, myid) {
+        return false;
+    }
+    out.tid = read_thread_id(msg_value);
+    *result_seen = true;
+    if kind.is_turn() {
+        return false;
+    }
+    discard(sandbox);
+    return true;
+}
+
 /// Read the thread id from a result value, trying both pointer shapes.
 fn read_thread_id(msg_value: &Value) -> String {
     return msg_value
         .pointer("/result/thread/id")
         .and_then(Value::as_str)
         .or_else(|| {
-            msg_value
+            return msg_value
                 .pointer("/result/threadId")
-                .and_then(Value::as_str)
+                .and_then(Value::as_str);
         })
         .unwrap_or("")
         .to_owned();
@@ -374,6 +423,13 @@ async fn main() -> ExitCode {
 
 /// Drive the capability checks against the session and record each outcome.
 async fn run_checks(session: &mut Session, checker: &mut Checker, tid: &str) {
+    check_reasoning(session, checker, tid).await;
+    check_shell(session, checker, tid).await;
+    check_memory(session, checker, tid).await;
+}
+
+/// Check turn completion plus reasoning surfacing on a think-then-answer prompt.
+async fn check_reasoning(session: &mut Session, checker: &mut Checker, tid: &str) {
     let (m1, _, r1) = session
         .turn(
             tid,
@@ -382,39 +438,35 @@ async fn run_checks(session: &mut Session, checker: &mut Checker, tid: &str) {
         .await;
     checker.check(
         "turn completes + message",
-        if m1.contains("ALPHA_OK") {
-            Outcome::Pass
-        } else {
-            Outcome::Fail
-        },
+        Outcome::from_bool(m1.contains("ALPHA_OK")),
         &format!("({})", &m1.chars().take(20).collect::<String>()),
     );
     checker.check(
         "reasoning surfaces",
-        if r1 > 0 { Outcome::Pass } else { Outcome::Fail },
+        Outcome::from_bool(r1 > 0),
         &format!("({r1} items)"),
     );
+}
+
+/// Check the shell tool executes and its output is reported.
+async fn check_shell(session: &mut Session, checker: &mut Checker, tid: &str) {
     let (m2, sh2, _) = session
         .turn(tid, "Run a shell command that prints exactly SHELL_OK_42.")
         .await;
     checker.check(
         "shell tool executes",
-        if sh2 > 0 {
-            Outcome::Pass
-        } else {
-            Outcome::Fail
-        },
+        Outcome::from_bool(sh2 > 0),
         &format!("({sh2})"),
     );
     checker.check(
         "shell output reported",
-        if m2.contains("SHELL_OK_42") || sh2 > 0 {
-            Outcome::Pass
-        } else {
-            Outcome::Fail
-        },
+        Outcome::from_bool(m2.contains("SHELL_OK_42") || sh2 > 0),
         "",
     );
+}
+
+/// Check multi-turn continuity by recalling a number from an earlier turn.
+async fn check_memory(session: &mut Session, checker: &mut Checker, tid: &str) {
     discard(session.turn(tid, "Remember the number 31337.").await);
     let (m4, _, _) = session
         .turn(
@@ -424,11 +476,7 @@ async fn run_checks(session: &mut Session, checker: &mut Checker, tid: &str) {
         .await;
     checker.check(
         "multi-turn continuity",
-        if m4.contains("31337") {
-            Outcome::Pass
-        } else {
-            Outcome::Fail
-        },
+        Outcome::from_bool(m4.contains("31337")),
         &format!("({})", &m4.chars().take(20).collect::<String>()),
     );
 }

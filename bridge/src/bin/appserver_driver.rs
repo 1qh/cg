@@ -20,17 +20,6 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio_stream as _;
 use uuid as _;
 
-/// Outcome of driving the app-server: whether the turn finished and the captured reply.
-struct DriveOutcome {
-    /// Whether a `turn/completed` or `turn/failed` notification arrived.
-    done: bool,
-    /// The captured agent message text.
-    msg: String,
-}
-
-/// Consume a value, suppressing the result. Why: kills `let_underscore` + `unused_results` lints.
-fn discard<T>(_value: T) {}
-
 /// Where the thread/turn handshake stands.
 #[derive(PartialEq, Eq)]
 enum Phase {
@@ -42,25 +31,36 @@ enum Phase {
     Started,
 }
 
-/// Mutable state threaded through the JSON-RPC drive loop.
-struct DriveState {
-    /// How far the thread/turn handshake has progressed.
-    phase: Phase,
-    /// The captured agent message text.
-    msg: String,
+/// Outcome of driving the app-server: whether the turn finished and the captured reply.
+struct DriveOutcome {
     /// Whether a `turn/completed` or `turn/failed` notification arrived.
     done: bool,
+    /// The captured agent message text.
+    msg: String,
+}
+
+/// Mutable state threaded through the JSON-RPC drive loop.
+struct DriveState {
+    /// Whether a `turn/completed` or `turn/failed` notification arrived.
+    done: bool,
+    /// The captured agent message text.
+    msg: String,
+    /// How far the thread/turn handshake has progressed.
+    phase: Phase,
 }
 
 /// Loop-constant connection: the codex stdin, the work dir, and the request-id counter.
 struct Conn<'conn> {
+    /// The monotonically advancing JSON-RPC request id.
+    counter: &'conn mut u64,
     /// The codex app-server stdin to write requests into.
     stdin: &'conn mut ChildStdin,
     /// The project root passed to `thread/start`.
     work_dir: &'conn Path,
-    /// The monotonically advancing JSON-RPC request id.
-    counter: &'conn mut u64,
 }
+
+/// Consume a value, suppressing the result. Why: kills `let_underscore` + `unused_results` lints.
+fn discard<T>(_value: T) {}
 
 /// Issue `thread/start`, marking the thread id pending.
 ///
@@ -138,7 +138,8 @@ fn handle_notification(state: &mut DriveState, parsed: &Value) {
         && item.get("type").and_then(Value::as_str) == Some("agent_message")
         && let Some(text) = item.get("text").and_then(Value::as_str)
     {
-        state.msg = text.to_owned();
+        state.msg.clear();
+        state.msg.push_str(text);
     }
     if method == "item/agentMessage/delta"
         && let Some(delta) = parsed.pointer("/params/delta").and_then(Value::as_str)
