@@ -40,14 +40,14 @@ use uuid::Uuid;
 #[derive(Deserialize, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 enum CodexEffort {
-    /// Minimal thinking.
-    Minimal,
+    /// High thinking.
+    High,
     /// Low thinking.
     Low,
     /// Medium thinking.
     Medium,
-    /// High thinking.
-    High,
+    /// Minimal thinking.
+    Minimal,
     /// Extra-high thinking (clamped to high).
     Xhigh,
 }
@@ -55,31 +55,17 @@ enum CodexEffort {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum CodexInput {
-    /// A user/assistant/system/developer message.
-    Message {
-        /// Author role of the message.
-        role: CodexRole,
-        /// Message content parts.
-        #[serde(default)]
-        content: Vec<CodexContent>,
-    },
-    /// A replayed reasoning item carrying the thought signature.
-    Reasoning {
-        /// Round-tripped thought signature.
-        #[serde(default)]
-        encrypted_content: Option<String>,
-    },
     /// A prior function call the model made.
     FunctionCall {
+        /// JSON-encoded call arguments.
+        #[serde(default)]
+        arguments: String,
         /// Correlation id pairing call with output.
         #[serde(default)]
         call_id: String,
         /// Function name invoked.
         #[serde(default)]
         name: String,
-        /// JSON-encoded call arguments.
-        #[serde(default)]
-        arguments: String,
     },
     /// The result of a prior function call.
     FunctionCallOutput {
@@ -90,6 +76,20 @@ enum CodexInput {
         #[serde(default)]
         output: String,
     },
+    /// A user/assistant/system/developer message.
+    Message {
+        /// Message content parts.
+        #[serde(default)]
+        content: Vec<CodexContent>,
+        /// Author role of the message.
+        role: CodexRole,
+    },
+    /// A replayed reasoning item carrying the thought signature.
+    Reasoning {
+        /// Round-tripped thought signature.
+        #[serde(default)]
+        encrypted_content: Option<String>,
+    },
     /// Any other input item kind.
     #[serde(other)]
     Other,
@@ -98,14 +98,14 @@ enum CodexInput {
 #[derive(Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum CodexRole {
-    /// End user.
-    User,
     /// Model assistant.
     Assistant,
-    /// System role.
-    System,
     /// Developer role.
     Developer,
+    /// System role.
+    System,
+    /// End user.
+    User,
     /// Any other role.
     #[serde(other)]
     Other,
@@ -144,68 +144,68 @@ struct CodexReasoning {
 /// Hand-typed codex `/v1/responses` request shape.
 #[derive(Deserialize)]
 struct CodexReq {
-    /// Requested model id, defaulting when absent.
-    #[serde(default)]
-    model: Option<String>,
-    /// System instructions for the turn.
-    #[serde(default)]
-    instructions: Option<String>,
     /// Stateless per-turn conversation input array.
     #[serde(default)]
     input: Vec<CodexInput>,
-    /// Function tools declared for the turn.
+    /// System instructions for the turn.
     #[serde(default)]
-    tools: Vec<CodexTool>,
+    instructions: Option<String>,
+    /// Requested model id, defaulting when absent.
+    #[serde(default)]
+    model: Option<String>,
     /// Reasoning-effort control.
     #[serde(default)]
     reasoning: Option<CodexReasoning>,
+    /// Function tools declared for the turn.
+    #[serde(default)]
+    tools: Vec<CodexTool>,
 }
 /// A function tool declaration.
 #[derive(Deserialize)]
 struct CodexTool {
+    /// Tool description.
+    #[serde(default)]
+    description: String,
     /// Declared tool kind.
     #[serde(rename = "type")]
     kind: CodexToolKind,
     /// Tool name.
     #[serde(default)]
     name: String,
-    /// Tool description.
-    #[serde(default)]
-    description: String,
     /// JSON-schema parameters.
     #[serde(default)]
     parameters: Option<Value>,
 }
 /// Mutable accumulator threaded through the gemini stream loop.
 struct StreamState {
-    /// Monotonic SSE sequence number.
-    seq: u64,
-    /// Accumulated visible assistant text.
-    text: String,
-    /// Accumulated reasoning text.
-    reasoning: String,
-    /// Latest captured thought signature.
-    rsn_sig: String,
-    /// Completed output items in emit order.
-    out_items: Vec<OutputItem>,
     /// Pending function calls (name, arguments).
     fcs: Vec<(String, String)>,
-    /// Token usage once observed.
-    usage: Option<ResponseUsage>,
-    /// Whether a finish reason was observed.
-    got_finish: bool,
     /// The observed finish reason.
     finish: Option<FinishReason>,
-    /// Next output index to assign.
-    output_index: u32,
-    /// Whether the reasoning item was emitted.
-    rsn_emitted: bool,
-    /// Whether the assistant message item is open.
-    msg_open: bool,
+    /// Whether a finish reason was observed.
+    got_finish: bool,
     /// The open message item id.
     msg_id: String,
     /// The open message output index.
     msg_oi: u32,
+    /// Whether the assistant message item is open.
+    msg_open: bool,
+    /// Completed output items in emit order.
+    out_items: Vec<OutputItem>,
+    /// Next output index to assign.
+    output_index: u32,
+    /// Accumulated reasoning text.
+    reasoning: String,
+    /// Whether the reasoning item was emitted.
+    rsn_emitted: bool,
+    /// Latest captured thought signature.
+    rsn_sig: String,
+    /// Monotonic SSE sequence number.
+    seq: u64,
+    /// Accumulated visible assistant text.
+    text: String,
+    /// Token usage once observed.
+    usage: Option<ResponseUsage>,
 }
 
 /// Discard a value to satisfy must-use / non-binding-let lints without altering behavior.
@@ -255,9 +255,9 @@ fn make_response(
 }
 
 /// Serialize an event to SSE; on serialize failure emit empty data.
-fn to_event(event: &ResponseStreamEvent) -> Result<Event, Infallible> {
+fn to_event(event: &ResponseStreamEvent) -> Event {
     let data = serde_json::to_string(event).unwrap_or_default();
-    return Ok(Event::default().data(data));
+    return Event::default().data(data);
 }
 
 /// Recursively strip Gemini-unsupported JSON-schema keywords from tool parameters.
@@ -307,24 +307,19 @@ fn build_contents(req: &CodexReq) -> Vec<Content> {
     let mut contents: Vec<Content> = Vec::new();
     let mut pending_sig: Option<String> = None;
     for item in &req.input {
-        match *item {
-            CodexInput::Message {
-                ref role,
-                ref content,
-            } => push_message(&mut contents, role, content),
-            CodexInput::Reasoning {
-                ref encrypted_content,
-            } => {
-                if let Some(ref enc) = *encrypted_content {
-                    if !enc.is_empty() {
-                        pending_sig = Some(enc.clone());
-                    }
+        match item {
+            CodexInput::Message { role, content } => {
+                push_message(&mut contents, role, content);
+            }
+            CodexInput::Reasoning { encrypted_content } => {
+                if let Some(enc) = encrypted_content
+                    && !enc.is_empty()
+                {
+                    pending_sig = Some(enc.clone());
                 }
             }
             CodexInput::FunctionCall {
-                ref name,
-                ref arguments,
-                ..
+                name, arguments, ..
             } => {
                 let args: Value = serde_json::from_str(arguments).unwrap_or_default();
                 let sig = pending_sig
@@ -335,10 +330,7 @@ fn build_contents(req: &CodexReq) -> Vec<Content> {
                         .with_role(Role::Model),
                 );
             }
-            CodexInput::FunctionCallOutput {
-                ref call_id,
-                ref output,
-            } => {
+            CodexInput::FunctionCallOutput { call_id, output } => {
                 let name = names
                     .get(call_id)
                     .cloned()
@@ -368,14 +360,10 @@ const fn effort_level(effort: CodexEffort) -> ThinkingLevel {
 }
 
 /// Build the gemini request builder from the codex request + reconstructed contents.
-fn build_request(
-    client: Gemini,
-    req: &CodexReq,
-    contents: Vec<Content>,
-) -> ContentBuilder {
+fn build_request(client: &Gemini, req: &CodexReq, contents: Vec<Content>) -> ContentBuilder {
     let mut builder = client.generate_content();
     builder.contents = contents;
-    if let Some(ref instructions) = req.instructions {
+    if let Some(instructions) = &req.instructions {
         builder = builder.with_system_prompt(instructions.clone());
     }
     for tool in &req.tools {
@@ -399,10 +387,10 @@ fn build_request(
         ..ToolConfig::default()
     });
     let mut thinking = ThinkingConfig::new().with_thoughts_included(true);
-    if let Some(ref reasoning) = req.reasoning {
-        if let Some(effort) = reasoning.effort {
-            thinking = thinking.with_thinking_level(effort_level(effort));
-        }
+    if let Some(reasoning) = &req.reasoning
+        && let Some(effort) = reasoning.effort
+    {
+        thinking = thinking.with_thinking_level(effort_level(effort));
     }
     builder = builder.with_thinking_config(thinking);
     return builder;
@@ -420,7 +408,7 @@ async fn emit_open(
         sequence_number: state.seq,
         response: make_response(response_id, model, Status::InProgress, vec![], None),
     });
-    if sender.send(to_event(&created)).await.is_err() {
+    if sender.send(Ok(to_event(&created))).await.is_err() {
         return false;
     }
     state.seq = state.seq.wrapping_add(1);
@@ -428,7 +416,7 @@ async fn emit_open(
         sequence_number: state.seq,
         response: make_response(response_id, model, Status::InProgress, vec![], None),
     });
-    return sender.send(to_event(&in_progress)).await.is_ok();
+    return sender.send(Ok(to_event(&in_progress))).await.is_ok();
 }
 
 /// Emit the reasoning item if pending; returns false if the receiver closed.
@@ -455,7 +443,7 @@ async fn flush_reasoning(
         output_index: state.output_index,
         item: OutputItem::Reasoning(reasoning_item.clone()),
     });
-    if sender.send(to_event(&added)).await.is_err() {
+    if sender.send(Ok(to_event(&added))).await.is_err() {
         return false;
     }
     state.seq = state.seq.wrapping_add(1);
@@ -464,7 +452,7 @@ async fn flush_reasoning(
         output_index: state.output_index,
         item: OutputItem::Reasoning(reasoning_item.clone()),
     });
-    if sender.send(to_event(&done)).await.is_err() {
+    if sender.send(Ok(to_event(&done))).await.is_err() {
         return false;
     }
     state.out_items.push(OutputItem::Reasoning(reasoning_item));
@@ -499,7 +487,7 @@ async fn emit_text_part(
             output_index: state.msg_oi,
             item: OutputItem::Message(message),
         });
-        if sender.send(to_event(&added)).await.is_err() {
+        if sender.send(Ok(to_event(&added))).await.is_err() {
             return false;
         }
     }
@@ -513,7 +501,7 @@ async fn emit_text_part(
         delta: part_text,
         logprobs: None,
     });
-    return sender.send(to_event(&delta)).await.is_ok();
+    return sender.send(Ok(to_event(&delta))).await.is_ok();
 }
 
 /// Process one gemini part; returns false if the receiver closed.
@@ -602,7 +590,7 @@ async fn consume_stream(
                 state.finish = Some(finish_reason);
             }
         }
-        if let Some(ref meta) = chunk.usage_metadata {
+        if let Some(meta) = &chunk.usage_metadata {
             state.usage = Some(map_usage(meta));
         }
     }
@@ -634,7 +622,7 @@ async fn close_message(
         output_index: state.msg_oi,
         item: OutputItem::Message(message.clone()),
     });
-    if sender.send(to_event(&done)).await.is_err() {
+    if sender.send(Ok(to_event(&done))).await.is_err() {
         return false;
     }
     let insert_at = if state.rsn_emitted {
@@ -642,7 +630,9 @@ async fn close_message(
     } else {
         0_usize
     };
-    state.out_items.insert(insert_at, OutputItem::Message(message));
+    state
+        .out_items
+        .insert(insert_at, OutputItem::Message(message));
     return true;
 }
 
@@ -668,34 +658,32 @@ async fn emit_function_call(
         output_index: state.output_index,
         item: OutputItem::FunctionCall(function_call.clone()),
     });
-    if sender.send(to_event(&added)).await.is_err() {
+    if sender.send(Ok(to_event(&added))).await.is_err() {
         return false;
     }
     state.seq = state.seq.wrapping_add(1);
-    let delta =
-        ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(
-            ResponseFunctionCallArgumentsDeltaEvent {
-                sequence_number: state.seq,
-                item_id: fc_id.clone(),
-                output_index: state.output_index,
-                delta: args.clone(),
-            },
-        );
-    if sender.send(to_event(&delta)).await.is_err() {
+    let delta = ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(
+        ResponseFunctionCallArgumentsDeltaEvent {
+            sequence_number: state.seq,
+            item_id: fc_id.clone(),
+            output_index: state.output_index,
+            delta: args.clone(),
+        },
+    );
+    if sender.send(Ok(to_event(&delta))).await.is_err() {
         return false;
     }
     state.seq = state.seq.wrapping_add(1);
-    let args_done =
-        ResponseStreamEvent::ResponseFunctionCallArgumentsDone(
-            ResponseFunctionCallArgumentsDoneEvent {
-                name: None,
-                sequence_number: state.seq,
-                item_id: fc_id,
-                output_index: state.output_index,
-                arguments: args,
-            },
-        );
-    if sender.send(to_event(&args_done)).await.is_err() {
+    let args_done = ResponseStreamEvent::ResponseFunctionCallArgumentsDone(
+        ResponseFunctionCallArgumentsDoneEvent {
+            name: None,
+            sequence_number: state.seq,
+            item_id: fc_id,
+            output_index: state.output_index,
+            arguments: args,
+        },
+    );
+    if sender.send(Ok(to_event(&args_done))).await.is_err() {
         return false;
     }
     state.seq = state.seq.wrapping_add(1);
@@ -704,23 +692,25 @@ async fn emit_function_call(
         output_index: state.output_index,
         item: OutputItem::FunctionCall(function_call.clone()),
     });
-    if sender.send(to_event(&item_done)).await.is_err() {
+    if sender.send(Ok(to_event(&item_done))).await.is_err() {
         return false;
     }
-    state.out_items.push(OutputItem::FunctionCall(function_call));
+    state
+        .out_items
+        .push(OutputItem::FunctionCall(function_call));
     state.output_index = state.output_index.wrapping_add(1);
     return true;
 }
 
 /// Map the gemini finish reason onto the responses incomplete reason, if any.
-const fn incomplete_reason(finish: Option<FinishReason>) -> Option<&'static str> {
+const fn incomplete_reason(finish: Option<&FinishReason>) -> Option<&'static str> {
     return match finish {
-        Some(FinishReason::MaxTokens) => Some("max_output_tokens"),
-        Some(FinishReason::Safety | FinishReason::Recitation | FinishReason::ImageSafety) => {
+        Some(&FinishReason::MaxTokens) => Some("max_output_tokens"),
+        Some(&(FinishReason::Safety | FinishReason::Recitation | FinishReason::ImageSafety)) => {
             Some("content_filter")
         }
         Some(
-            FinishReason::FinishReasonUnspecified
+            &(FinishReason::FinishReasonUnspecified
             | FinishReason::Stop
             | FinishReason::Language
             | FinishReason::Other
@@ -729,7 +719,7 @@ const fn incomplete_reason(finish: Option<FinishReason>) -> Option<&'static str>
             | FinishReason::Spii
             | FinishReason::MalformedFunctionCall
             | FinishReason::UnexpectedToolCall
-            | FinishReason::TooManyToolCalls,
+            | FinishReason::TooManyToolCalls),
         )
         | None => None,
     };
@@ -750,10 +740,10 @@ async fn emit_terminal(
             sequence_number: state.seq,
             response: make_response(response_id, model, Status::Failed, out_items, usage),
         });
-        discard(sender.send(to_event(&failed)).await);
+        discard(sender.send(Ok(to_event(&failed))).await);
         return;
     }
-    if let Some(reason) = incomplete_reason(state.finish.clone()) {
+    if let Some(reason) = incomplete_reason(state.finish.as_ref()) {
         let mut resp = make_response(response_id, model, Status::Incomplete, out_items, usage);
         resp.incomplete_details = Some(IncompleteDetails {
             reason: reason.into(),
@@ -763,7 +753,7 @@ async fn emit_terminal(
             sequence_number: state.seq,
             response: resp,
         });
-        discard(sender.send(to_event(&incomplete)).await);
+        discard(sender.send(Ok(to_event(&incomplete))).await);
         return;
     }
     state.seq = state.seq.wrapping_add(1);
@@ -771,7 +761,7 @@ async fn emit_terminal(
         sequence_number: state.seq,
         response: make_response(response_id, model, Status::Completed, out_items, usage),
     });
-    discard(sender.send(to_event(&completed)).await);
+    discard(sender.send(Ok(to_event(&completed))).await);
 }
 
 /// Drive the gemini stream and emit the typed responses event sequence.
@@ -802,17 +792,14 @@ async fn stream_responses(
         return;
     }
 
-    let stream = match builder.execute_stream().await {
-        Ok(opened) => opened,
-        Err(_) => {
-            state.seq = state.seq.wrapping_add(1);
-            let failed = ResponseStreamEvent::ResponseFailed(ResponseFailedEvent {
-                sequence_number: state.seq,
-                response: make_response(response_id, model, Status::Failed, vec![], None),
-            });
-            discard(sender.send(to_event(&failed)).await);
-            return;
-        }
+    let Ok(stream) = builder.execute_stream().await else {
+        state.seq = state.seq.wrapping_add(1);
+        let failed = ResponseStreamEvent::ResponseFailed(ResponseFailedEvent {
+            sequence_number: state.seq,
+            response: make_response(response_id, model, Status::Failed, vec![], None),
+        });
+        discard(sender.send(Ok(to_event(&failed))).await);
+        return;
     };
 
     if !consume_stream(&sender, &mut state, stream).await {
@@ -858,11 +845,11 @@ async fn responses(
                 sequence_number: 1_u64,
                 response,
             });
-            discard(sender.send(to_event(&event)).await);
+            discard(sender.send(Ok(to_event(&event))).await);
         }));
         return Sse::new(ReceiverStream::new(receiver));
     };
-    let builder = build_request(client, &req, contents);
+    let builder = build_request(&client, &req, contents);
 
     discard(tokio::spawn(async move {
         stream_responses(builder, sender, &response_id, &model).await;
@@ -874,12 +861,15 @@ async fn responses(
 #[tokio::main]
 async fn main() {
     let Ok(api_key) = var("GEMINI_API_KEY") else {
-        discard(writeln!(stderr(), "GEMINI_API_KEY env required (no fallback)"));
+        discard(writeln!(
+            stderr(),
+            "GEMINI_API_KEY env required (no fallback)"
+        ));
         return;
     };
     let app = Router::new()
         .route("/v1/responses", post(responses))
-        .route("/health/liveliness", get(|| async { return "ok" }))
+        .route("/health/liveliness", get(async || return "ok"))
         .with_state(AppState { api_key });
     let Ok(port) = var("PORT") else {
         discard(writeln!(stderr(), "PORT env required (no fallback)"));

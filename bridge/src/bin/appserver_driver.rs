@@ -1,17 +1,24 @@
-//! SPIKE: can PURE RUST drive codex app-server over JSON-RPC (the verify-harness side)?
-//! Spawn codex app-server -> initialize -> thread/start -> turn/start -> capture agent message + completion.
+//! SPIKE: can PURE RUST drive codex `app-server` over JSON-RPC (the verify-harness side)?
+//! Spawn codex `app-server` -> `initialize` -> `thread/start` -> `turn/start` -> capture agent message + completion.
 //! If this works, the whole product (bridge + launcher + can-fail suite) can be pure Rust.
-use serde_json::{json, Value};
+use async_openai as _;
+use axum as _;
+use futures as _;
+use gemini_rust as _;
+use serde as _;
+use serde_json::{Value, json};
 use std::env::{temp_dir, var};
 use std::fs::create_dir_all;
-use std::io::stdout;
 use std::io::Error as IoError;
 use std::io::Write as _;
+use std::io::{stderr, stdout};
 use std::path::Path;
 use std::process::id as process_id;
-use std::process::{ExitCode, ExitStatus, Stdio};
+use std::process::{ExitCode, Stdio};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio_stream as _;
+use uuid as _;
 
 /// Outcome of driving the app-server: whether the turn finished and the captured reply.
 struct DriveOutcome {
@@ -21,7 +28,7 @@ struct DriveOutcome {
     msg: String,
 }
 
-/// Consume a value, suppressing the result. Why: kills let_underscore + unused_results lints.
+/// Consume a value, suppressing the result. Why: kills `let_underscore` + `unused_results` lints.
 fn discard<T>(_value: T) {}
 
 /// Drive the JSON-RPC loop: reply to server requests, start a thread, start a turn, capture the message.
@@ -52,34 +59,40 @@ async fn drive(
             continue;
         }
         if parsed.get("id").is_some() && parsed.get("result").is_some() && !started {
-            if thread_id.is_empty() {
-                let cwd = work_dir.to_str().unwrap_or("");
-                let request = rpc_line(
-                    "thread/start",
-                    json!({"model":"gemini-3.5-flash","modelProvider":"r","cwd":cwd,"approvalPolicy":"never","sandbox":"read-only"}),
-                    counter,
-                );
-                let Ok(()) = stdin.write_all(request.as_bytes()).await else {
-                    return DriveOutcome { done, msg };
-                };
-                thread_id = "pending".into();
-            } else if thread_id == "pending" {
-                let tid = parsed
-                    .pointer("/result/thread/id")
-                    .and_then(Value::as_str)
-                    .or_else(|| parsed.pointer("/result/threadId").and_then(Value::as_str))
-                    .unwrap_or("")
-                    .to_owned();
-                thread_id = tid.clone();
-                let request = rpc_line(
-                    "turn/start",
-                    json!({"threadId":tid,"input":[{"type":"text","text":"Reply with exactly: PURE_RUST_DRIVER_OK","text_elements":[]}]}),
-                    counter,
-                );
-                let Ok(()) = stdin.write_all(request.as_bytes()).await else {
-                    return DriveOutcome { done, msg };
-                };
-                started = true;
+            match thread_id.as_str() {
+                "" => {
+                    let cwd = work_dir.to_str().unwrap_or("");
+                    let request = rpc_line(
+                        "thread/start",
+                        &json!({"model":"gemini-3.5-flash","modelProvider":"r","cwd":cwd,"approvalPolicy":"never","sandbox":"read-only"}),
+                        counter,
+                    );
+                    let Ok(()) = stdin.write_all(request.as_bytes()).await else {
+                        return DriveOutcome { done, msg };
+                    };
+                    thread_id = "pending".into();
+                }
+                "pending" => {
+                    let tid = parsed
+                        .pointer("/result/thread/id")
+                        .and_then(Value::as_str)
+                        .or_else(|| {
+                            return parsed.pointer("/result/threadId").and_then(Value::as_str);
+                        })
+                        .unwrap_or("")
+                        .to_owned();
+                    thread_id = tid.clone();
+                    let request = rpc_line(
+                        "turn/start",
+                        &json!({"threadId":tid,"input":[{"type":"text","text":"Reply with exactly: PURE_RUST_DRIVER_OK","text_elements":[]}]}),
+                        counter,
+                    );
+                    let Ok(()) = stdin.write_all(request.as_bytes()).await else {
+                        return DriveOutcome { done, msg };
+                    };
+                    started = true;
+                }
+                _ => {}
             }
         }
         if let Some(method) = parsed.get("method").and_then(Value::as_str) {
@@ -128,8 +141,11 @@ async fn init_repo(work_dir: &Path) {
 }
 
 /// Build one JSON-RPC request line and advance the request id counter.
-fn rpc_line(method: &str, params: Value, counter: &mut u64) -> String {
-    let line = format!("{}\n", json!({"method": method, "id": *counter, "params": params}));
+fn rpc_line(method: &str, params: &Value, counter: &mut u64) -> String {
+    let line = format!(
+        "{}\n",
+        json!({"method": method, "id": *counter, "params": params})
+    );
     *counter = (*counter).wrapping_add(1);
     return line;
 }
@@ -143,7 +159,10 @@ async fn run() -> Result<(), ()> {
     init_repo(&work_dir).await;
 
     let Ok(port) = var("BRIDGE_PORT") else {
-        eprintln!("BRIDGE_PORT env required (no fallback)");
+        discard(writeln!(
+            stderr(),
+            "BRIDGE_PORT env required (no fallback)"
+        ));
         return Err(());
     };
     let Ok(mut child) = spawn_codex(&port) else {
@@ -159,7 +178,7 @@ async fn run() -> Result<(), ()> {
     let mut counter = 1_u64;
     let init = rpc_line(
         "initialize",
-        json!({"clientInfo":{"name":"x","version":"0"},"capabilities":null}),
+        &json!({"clientInfo":{"name":"x","version":"0"},"capabilities":null}),
         &mut counter,
     );
     let Ok(()) = stdin.write_all(init.as_bytes()).await else {
@@ -172,7 +191,7 @@ async fn run() -> Result<(), ()> {
     let msg = outcome.msg;
     discard(writeln!(
         stdout(),
-        "  pure-Rust driver: done={done} reply={msg:?}"
+        "  pure-Rust driver: done={done} reply={msg}"
     ));
     discard(writeln!(
         stdout(),
