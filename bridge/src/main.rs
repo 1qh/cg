@@ -319,13 +319,13 @@ fn sanitize_schema(value: &mut Value) {
             for child in map.values_mut() {
                 sanitize_schema(child);
             }
-        }
+        },
         Value::Array(ref mut arr) => {
             for child in arr.iter_mut() {
                 sanitize_schema(child);
             }
-        }
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+        },
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {},
     }
 }
 
@@ -412,19 +412,19 @@ fn push_input_item(
     match item {
         CodexInput::Message { role, content } => {
             push_message(contents, role, content);
-        }
+        },
         CodexInput::Reasoning { encrypted_content } => {
             capture_pending_sig(pending_sig, encrypted_content.as_ref());
-        }
+        },
         CodexInput::FunctionCall {
             name, arguments, ..
         } => {
             push_function_call(contents, pending_sig, name, arguments);
-        }
+        },
         CodexInput::FunctionCallOutput { call_id, output } => {
             push_function_output(contents, names, call_id, output);
-        }
-        CodexInput::Unknown => {}
+        },
+        CodexInput::Unknown => {},
     }
 }
 
@@ -635,12 +635,12 @@ async fn handle_part(
                 state.rsn_sig = signature;
             }
             return true;
-        }
+        },
         Part::Text {
             text: part_text, ..
         } if !part_text.is_empty() => {
             return Box::pin(emit_text_part(sender, state, part_text)).await;
-        }
+        },
         Part::FunctionCall {
             function_call,
             thought_signature,
@@ -652,7 +652,7 @@ async fn handle_part(
                 thought_signature,
             ))
             .await;
-        }
+        },
         Part::Text { .. }
         | Part::InlineData { .. }
         | Part::FunctionResponse { .. }
@@ -831,7 +831,7 @@ const fn incomplete_reason(finish: Option<&FinishReason>) -> Option<&'static str
         Some(&FinishReason::MaxTokens) => Some("max_output_tokens"),
         Some(&(FinishReason::Safety | FinishReason::Recitation | FinishReason::ImageSafety)) => {
             Some("content_filter")
-        }
+        },
         Some(
             &(FinishReason::FinishReasonUnspecified
             | FinishReason::Stop
