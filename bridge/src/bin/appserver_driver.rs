@@ -73,7 +73,13 @@ async fn send_thread_start(conn: &mut Conn<'_>, state: &mut DriveState) -> Resul
     let cwd = conn.work_dir.to_str().unwrap_or("");
     let request = rpc_line(
         "thread/start",
-        &json!({"model":"gemini-3.5-flash","modelProvider":"r","cwd":cwd,"approvalPolicy":"never","sandbox":"read-only"}),
+        &json!({
+            "model": "gemini-3.5-flash",
+            "modelProvider": "r",
+            "cwd": cwd,
+            "approvalPolicy": "never",
+            "sandbox": "read-only"
+        }),
         conn.counter,
     );
     let Ok(()) = conn.stdin.write_all(request.as_bytes()).await else {
@@ -100,7 +106,14 @@ async fn send_turn_start(
         .to_owned();
     let request = rpc_line(
         "turn/start",
-        &json!({"threadId":tid,"input":[{"type":"text","text":"Reply with exactly: PURE_RUST_DRIVER_OK","text_elements":[]}]}),
+        &json!({
+            "threadId": tid,
+            "input": [{
+                "type": "text",
+                "text": "Reply with exactly: PURE_RUST_DRIVER_OK",
+                "text_elements": []
+            }]
+        }),
         conn.counter,
     );
     let Ok(()) = conn.stdin.write_all(request.as_bytes()).await else {

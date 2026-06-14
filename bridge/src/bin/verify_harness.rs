@@ -269,7 +269,7 @@ impl Session {
             Err(err) => {
                 discard(writeln!(stderr(), "spawn codex failed: {err}"));
                 Err(())
-            }
+            },
         };
     }
 
@@ -279,7 +279,13 @@ impl Session {
             .rpc(RpcCall {
                 kind: RpcKind::Plain,
                 method: "thread/start",
-                params: json!({"model":"gemini-3.5-flash","modelProvider":"r","cwd":self.wd,"approvalPolicy":"never","sandbox":sandbox}),
+                params: json!({
+                    "model": "gemini-3.5-flash",
+                    "modelProvider": "r",
+                    "cwd": self.wd,
+                    "approvalPolicy": "never",
+                    "sandbox": sandbox
+                }),
                 sandbox,
             })
             .await
@@ -316,7 +322,10 @@ impl Session {
             .rpc(RpcCall {
                 kind: RpcKind::Turn,
                 method: "turn/start",
-                params: json!({"threadId":tid,"input":[{"type":"text","text":text,"text_elements":[]}]}),
+                params: json!({
+                    "threadId": tid,
+                    "input": [{"type": "text", "text": text, "text_elements": []}]
+                }),
                 sandbox: "",
             })
             .await;
@@ -406,12 +415,12 @@ fn apply_item(item: &Value, out: &mut RpcOut) {
             if let Some(text) = item.get("text").and_then(Value::as_str) {
                 out.msg = text.into();
             }
-        }
+        },
         Some(item_type) if item_type.contains("command") => {
             out.shell = out.shell.wrapping_add(1);
-        }
+        },
         Some("reasoning") => out.reasoning = out.reasoning.wrapping_add(1),
-        _ => {}
+        _ => {},
     }
 }
 
@@ -497,7 +506,7 @@ async fn check_shell(session: &mut Session, checker: &mut Checker, tid: &str) {
 /// Check multi-turn continuity by recalling a number from an earlier turn.
 async fn check_memory(session: &mut Session, checker: &mut Checker, tid: &str) {
     discard(session.turn(tid, "Remember the number 31337.").await);
-    let (m4, _, _) = session
+    let (m4, ..) = session
         .turn(
             tid,
             "What number did I ask you to remember? Reply with just the number.",
@@ -526,7 +535,8 @@ fn report(checker: &Checker) {
         stdout(),
         "  >> {}",
         if pass == total {
-            "PROVEN \u{2014} pure-Rust harness runs the capability checks GREEN (verify suite ports to Rust, zero lose)"
+            "PROVEN \u{2014} pure-Rust harness runs the capability checks GREEN (verify suite \
+             ports to Rust, zero lose)"
         } else {
             "see failures"
         }
