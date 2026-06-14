@@ -10,6 +10,9 @@ description = "Pure-Rust /v1/responses server translating codex's responses API 
 name = "codex-gemini-bridge"
 path = "src/main.rs"
 
+[workspace]
+exclude = ["vendor/gemini-rust"]
+
 [dependencies]
 async-openai = { version = "0.41", default-features = false, features = ["response-types"] }
 axum = "0.8"

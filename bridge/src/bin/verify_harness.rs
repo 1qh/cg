@@ -1,17 +1,22 @@
 //! SPIKE: pure-Rust comprehensive verify harness (Node harness-live.mjs equivalent) — proves the
 //! can-fail suite ports to Rust with ZERO LOSE. Runs key checks against the bridge, same as Node.
+use std::{
+    env::{temp_dir, var},
+    fs::create_dir_all,
+    io::{Write as _, stderr, stdout},
+    process::{ExitCode, Stdio, id},
+};
+
 use async_openai as _;
 use axum as _;
 use futures as _;
 use gemini_rust as _;
 use serde as _;
 use serde_json::{Value, json};
-use std::env::{temp_dir, var};
-use std::fs::create_dir_all;
-use std::io::{Write as _, stderr, stdout};
-use std::process::{ExitCode, Stdio, id};
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::{
+    io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines},
+    process::{Child, ChildStdin, ChildStdout, Command},
+};
 use tokio_stream as _;
 use uuid as _;
 
@@ -29,6 +34,7 @@ impl Outcome {
     const fn label(self) -> &'static str {
         return if self.passed() { "PASS" } else { "FAIL" };
     }
+
     /// True when this outcome is a pass.
     const fn passed(self) -> bool {
         return matches!(self, Self::Pass);
@@ -71,7 +77,8 @@ struct Checker {
     total: u32,
 }
 
-/// Outcome of one `rpc` call: agent message text, shell-call count, reasoning-item count, thread id.
+/// Outcome of one `rpc` call: agent message text, shell-call count, reasoning-item count, thread
+/// id.
 struct RpcOut {
     /// Accumulated agent message text.
     msg: String,
@@ -158,6 +165,7 @@ impl Session {
         }
         return Ok(());
     }
+
     /// Drain responses for request `myid` until the turn or plain rpc concludes.
     async fn drain(&mut self, myid: u64, kind: RpcKind, sandbox: &str) -> RpcOut {
         let mut out = RpcOut::empty();
@@ -173,10 +181,12 @@ impl Session {
         {}
         return out;
     }
+
     /// Spawn `codex app-server` against the local bridge and run `initialize`.
     ///
     /// # Errors
-    /// Returns `Err(())` when `BRIDGE_PORT` is unset, the spawn fails, or a child pipe is unavailable.
+    /// Returns `Err(())` when `BRIDGE_PORT` is unset, the spawn fails, or a child pipe is
+    /// unavailable.
     async fn new(wd: &str, sandbox: &str) -> Result<Self, ()> {
         let Ok(port) = var("BRIDGE_PORT") else {
             discard(writeln!(stderr(), "BRIDGE_PORT env required (no fallback)"));
@@ -213,6 +223,7 @@ impl Session {
         );
         return Ok(session);
     }
+
     /// Send one JSON-RPC request, drain responses, and summarize the turn.
     async fn rpc(&mut self, call: RpcCall<'_>) -> RpcOut {
         let myid = self.id;
@@ -227,6 +238,7 @@ impl Session {
         }
         return self.drain(myid, call.kind, call.sandbox).await;
     }
+
     /// Spawn the `codex app-server` child wired at the given bridge port.
     ///
     /// # Errors
@@ -260,6 +272,7 @@ impl Session {
             }
         };
     }
+
     /// Start a new thread bound to the BYOK model and return its thread id.
     async fn start_thread(&mut self, sandbox: &str) -> String {
         return self
@@ -272,6 +285,7 @@ impl Session {
             .await
             .tid;
     }
+
     /// Process one drained line and fold its effect into the accumulator.
     async fn step(&mut self, raw_line: &str, ctx: &mut DrainCtx<'_>) -> Flow {
         let trimmed = raw_line.trim().to_owned();
@@ -295,6 +309,7 @@ impl Session {
         }
         return Flow::Continue;
     }
+
     /// Run one turn with the given text input and return message + shell + reasoning counts.
     async fn turn(&mut self, tid: &str, text: &str) -> (String, u32, u32) {
         let out = self

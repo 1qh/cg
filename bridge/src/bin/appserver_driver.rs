@@ -1,22 +1,25 @@
 //! SPIKE: can PURE RUST drive codex `app-server` over JSON-RPC (the verify-harness side)?
-//! Spawn codex `app-server` -> `initialize` -> `thread/start` -> `turn/start` -> capture agent message + completion.
-//! If this works, the whole product (bridge + launcher + can-fail suite) can be pure Rust.
+//! Spawn codex `app-server` -> `initialize` -> `thread/start` -> `turn/start` -> capture agent
+//! message + completion. If this works, the whole product (bridge + launcher + can-fail suite) can
+//! be pure Rust.
+use std::{
+    env::{temp_dir, var},
+    fs::create_dir_all,
+    io::{Error as IoError, Write as _, stderr, stdout},
+    path::Path,
+    process::{ExitCode, Stdio, id as process_id},
+};
+
 use async_openai as _;
 use axum as _;
 use futures as _;
 use gemini_rust as _;
 use serde as _;
 use serde_json::{Value, json};
-use std::env::{temp_dir, var};
-use std::fs::create_dir_all;
-use std::io::Error as IoError;
-use std::io::Write as _;
-use std::io::{stderr, stdout};
-use std::path::Path;
-use std::process::id as process_id;
-use std::process::{ExitCode, Stdio};
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::{
+    io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines},
+    process::{Child, ChildStdin, ChildStdout, Command},
+};
 use tokio_stream as _;
 use uuid as _;
 
@@ -191,7 +194,8 @@ async fn drive_line(conn: &mut Conn<'_>, state: &mut DriveState, rawline: &str) 
     return Ok(());
 }
 
-/// Drive the JSON-RPC loop: reply to server requests, start a thread, start a turn, capture the message.
+/// Drive the JSON-RPC loop: reply to server requests, start a thread, start a turn, capture the
+/// message.
 async fn drive(
     stdin: &mut ChildStdin,
     lines: &mut Lines<BufReader<ChildStdout>>,
@@ -266,7 +270,8 @@ fn read_port() -> Result<String, ()> {
 /// Spawn codex, take its piped stdin/stdout, and send the `initialize` request.
 ///
 /// # Errors
-/// Returns `Err(())` when the spawn fails, a stdio handle is missing, or the initialize write fails.
+/// Returns `Err(())` when the spawn fails, a stdio handle is missing, or the initialize write
+/// fails.
 async fn start_session(
     port: &str,
     counter: &mut u64,
@@ -314,7 +319,8 @@ fn print_outcome(outcome: &DriveOutcome) {
 /// Run the spike: spawn codex app-server, drive it, print the proof line.
 ///
 /// # Errors
-/// Returns `Err(())` when work-dir creation, the required env read, the spawn, or the initialize write fails.
+/// Returns `Err(())` when work-dir creation, the required env read, the spawn, or the initialize
+/// write fails.
 async fn run() -> Result<(), ()> {
     let work_dir = temp_dir().join(format!("rsdrv-{}", process_id()));
     let Ok(()) = create_dir_all(&work_dir) else {

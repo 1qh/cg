@@ -1,10 +1,12 @@
-//! MAX-TYPESAFE bridge: async-openai `CreateResponse` (typed request) -> gemini-rust (typed gemini) ->
-//! async-openai `ResponseStreamEvent` (typed emit). No raw `serde_json::Value` for request/response shapes.
-use core::convert::Infallible;
-use core::mem::take;
-use std::collections::HashMap;
-use std::env::var;
-use std::io::{Write as _, stderr};
+//! MAX-TYPESAFE bridge: async-openai `CreateResponse` (typed request) -> gemini-rust (typed gemini)
+//! -> async-openai `ResponseStreamEvent` (typed emit). No raw `serde_json::Value` for
+//! request/response shapes.
+use core::{convert::Infallible, mem::take};
+use std::{
+    collections::HashMap,
+    env::var,
+    io::{Write as _, stderr},
+};
 
 use async_openai::types::responses::{
     AssistantRole, FunctionToolCall, IncompleteDetails, InputTokenDetails, OutputItem,
@@ -21,18 +23,18 @@ use axum::{
     response::sse::{Event, Sse},
     routing::{get, post},
 };
-use futures::StreamExt as _;
-use futures::stream::Stream;
-use gemini_rust::tools::ToolConfig;
+use futures::{StreamExt as _, stream::Stream};
 use gemini_rust::{
     Candidate, Content, ContentBuilder, FinishReason, FunctionCall, FunctionDeclaration,
     FunctionResponse, Gemini, GenerationStream, Model, Part, Role, ThinkingConfig, ThinkingLevel,
-    Tool as GTool, UsageMetadata,
+    Tool as GTool, UsageMetadata, tools::ToolConfig,
 };
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::net::TcpListener;
-use tokio::sync::mpsc::{Sender, channel};
+use tokio::{
+    net::TcpListener,
+    sync::mpsc::{Sender, channel},
+};
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
