@@ -404,7 +404,7 @@ struct StreamState {
     /// Whether the assistant message item is open.
     msg_open: MsgOpen,
     /// Completed output items in emit order.
-    out_items: Vec<OutputItem>,
+    out_items: Vec<(u32, OutputItem)>,
     /// Next output index to assign.
     output_index: u32,
     /// Accumulated reasoning text.
@@ -857,7 +857,9 @@ async fn flush_reasoning(
     if sender.send(Ok(to_event(&done))).await.is_err() {
         return false;
     }
-    state.out_items.push(OutputItem::Reasoning(reasoning_item));
+    state
+        .out_items
+        .push((state.output_index, OutputItem::Reasoning(reasoning_item)));
     state.output_index = state.output_index.wrapping_add(1);
     return true;
 }
@@ -1099,14 +1101,9 @@ async fn close_message(
     if sender.send(Ok(to_event(&done))).await.is_err() {
         return false;
     }
-    let insert_at = if state.rsn_emitted == RsnEmitted::Yes {
-        1_usize.min(state.out_items.len())
-    } else {
-        0_usize
-    };
     state
         .out_items
-        .insert(insert_at, OutputItem::Message(message));
+        .push((state.msg_oi, OutputItem::Message(message)));
     return true;
 }
 
@@ -1174,7 +1171,7 @@ async fn emit_function_call(
     }
     state
         .out_items
-        .push(OutputItem::FunctionCall(function_call));
+        .push((state.output_index, OutputItem::FunctionCall(function_call)));
     state.output_index = state.output_index.wrapping_add(1);
     return true;
 }
@@ -1214,7 +1211,9 @@ async fn emit_terminal(
     state: &mut StreamState,
     meta: RespMeta<'_>,
 ) {
-    let out_items = take(&mut state.out_items);
+    let mut tagged = take(&mut state.out_items);
+    tagged.sort_by_key(|entry| return entry.0);
+    let out_items: Vec<OutputItem> = tagged.into_iter().map(|entry| return entry.1).collect();
     let usage = state.usage.take();
     let outcome = if state.got_finish == FinishObserved::No {
         TerminalOutcome::Failed
