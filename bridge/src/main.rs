@@ -26,9 +26,9 @@ use axum::{
 use futures::{StreamExt as _, stream::Stream};
 use gemini_rust::{
     Blob, Candidate, Content, ContentBuilder, FinishReason, FunctionCall, FunctionCallingConfig,
-    FunctionCallingMode, FunctionDeclaration, FunctionResponse, Gemini, GenerationStream,
-    MediaResolution, MediaResolutionLevel, Model, Part, Role, ThinkingConfig, ThinkingLevel,
-    Tool as GTool, UsageMetadata, tools::ToolConfig,
+    FunctionCallingMode, FunctionDeclaration, FunctionResponse, Gemini, GenerationResponse,
+    GenerationStream, MediaResolution, MediaResolutionLevel, Model, Part, Role, ThinkingConfig,
+    ThinkingLevel, Tool as GTool, UsageMetadata, tools::ToolConfig,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -924,6 +924,23 @@ async fn handle_candidate(
     return true;
 }
 
+/// Fold one gemini chunk into the accumulator; returns false if the receiver closed.
+async fn consume_chunk(
+    sender: &Sender<Result<Event, Infallible>>,
+    state: &mut StreamState,
+    chunk: GenerationResponse,
+) -> bool {
+    if let Some(candidate) = chunk.candidates.into_iter().next()
+        && !Box::pin(handle_candidate(sender, state, candidate)).await
+    {
+        return false;
+    }
+    if let Some(meta) = &chunk.usage_metadata {
+        state.usage = Some(map_usage(meta));
+    }
+    return true;
+}
+
 /// Consume the gemini stream into the accumulator; returns false if the receiver closed.
 async fn consume_stream(
     sender: &Sender<Result<Event, Infallible>>,
@@ -931,14 +948,15 @@ async fn consume_stream(
     mut stream: GenerationStream,
 ) -> bool {
     while let Some(item) = stream.next().await {
-        let Ok(chunk) = item else { break };
-        if let Some(candidate) = chunk.candidates.into_iter().next()
-            && !Box::pin(handle_candidate(sender, state, candidate)).await
-        {
+        let chunk = match item {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                discard(writeln!(stderr(), "gemini stream error: {error}"));
+                break;
+            },
+        };
+        if !Box::pin(consume_chunk(sender, state, chunk)).await {
             return false;
-        }
-        if let Some(meta) = &chunk.usage_metadata {
-            state.usage = Some(map_usage(meta));
         }
     }
     return true;
