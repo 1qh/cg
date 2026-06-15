@@ -23,3 +23,7 @@ harness:
 ## help: list targets
 help:
 	@grep -hE '^## ' $(MAKEFILE_LIST) | sed 's/## //'
+
+## codex-drift: assert the bridge's faithful codex-type mirror still covers codex source (CI drift gate)
+codex-drift:
+	@scripts/codex-mirror-drift-check.sh
