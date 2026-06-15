@@ -6,6 +6,7 @@ use std::{
     collections::HashMap,
     env::var,
     io::{Write as _, stderr},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use async_openai::types::responses::{
@@ -402,6 +403,8 @@ impl StreamState {
 /// Borrowed response identity (id + model) shared across every emitted event.
 #[derive(Clone, Copy)]
 struct RespMeta<'meta> {
+    /// Unix seconds the request arrived, stamped as the response `created_at`.
+    created: u64,
     /// The model id stamped on every event.
     model: &'meta str,
     /// The response id stamped on every event.
@@ -422,7 +425,7 @@ fn make_response(
         background: None,
         billing: None,
         conversation: None,
-        created_at: 0_u64,
+        created_at: meta.created,
         completed_at: None,
         error: None,
         id: meta.response_id.to_owned(),
@@ -1259,11 +1262,23 @@ async fn stream_responses(
     drive_with_deadline(&sender, &mut state, stream, meta).await;
 }
 
-/// Codex `/v1/responses` handler: translate to gemini, stream typed responses events.
+/// Unix seconds now; `0` if the clock is before the epoch.
+fn now_unix() -> u64 {
+    return SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| return elapsed.as_secs());
+}
+
 /// Spawn a task emitting a single `response.failed` for a request rejected before streaming starts.
-fn spawn_failed(sender: Sender<Result<Event, Infallible>>, response_id: String, model: String) {
+fn spawn_failed(
+    sender: Sender<Result<Event, Infallible>>,
+    response_id: String,
+    model: String,
+    created: u64,
+) {
     discard(tokio::spawn(Box::pin(async move {
         let meta = RespMeta {
+            created,
             model: &model,
             response_id: &response_id,
         };
@@ -1276,6 +1291,7 @@ async fn responses(
     State(state): State<AppState>,
     Json(req): Json<CodexReq>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let created = now_unix();
     let (sender, receiver) = channel::<Result<Event, Infallible>>(64);
     let response_id = format!("resp_{}", Uuid::new_v4().simple());
     let Some(model) = req
@@ -1287,7 +1303,7 @@ async fn responses(
             stderr(),
             "request rejected: no model (no fallback)"
         ));
-        spawn_failed(sender, response_id, String::new());
+        spawn_failed(sender, response_id, String::new(), created);
         return Sse::new(ReceiverStream::new(receiver));
     };
     let contents = build_contents(&req);
@@ -1297,12 +1313,13 @@ async fn responses(
         format!("models/{model}")
     };
     let Ok(client) = Gemini::with_model(state.api_key, Model::Custom(api_model)) else {
-        spawn_failed(sender, response_id, model);
+        spawn_failed(sender, response_id, model, created);
         return Sse::new(ReceiverStream::new(receiver));
     };
     let builder = build_request(&client, &req, contents);
     discard(tokio::spawn(Box::pin(async move {
         let meta = RespMeta {
+            created,
             model: &model,
             response_id: &response_id,
         };
