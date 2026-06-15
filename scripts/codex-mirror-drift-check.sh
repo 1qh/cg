@@ -8,16 +8,26 @@ set -euo pipefail
 here="$(dirname "${0}")"
 root="$(cd "${here}/.." && pwd)"
 tag="$(cat "${root}/bridge/.codex-pin")"
-src="$(curl -fsSL "https://raw.githubusercontent.com/openai/codex/${tag}/codex-rs/protocol/src/openai_models.rs")"
+base="https://raw.githubusercontent.com/openai/codex/${tag}/codex-rs/protocol/src"
+efforts_src="$(curl -fsSL "${base}/openai_models.rs")"
+models_src="$(curl -fsSL "${base}/models.rs")"
 bridge="$(cat "${root}/bridge/src/main.rs")"
-# codex's ReasoningEffort wire values (the string arms in its FromStr/Display).
-efforts="$(grep -oE '"(none|minimal|low|medium|high|xhigh)"' <<< "${src}" | tr -d '"' | sort -u)"
+
 missing=""
+# (1) every ReasoningEffort wire value codex defines must be handled by CodexEffort.
+efforts="$(grep -oE '"(none|minimal|low|medium|high|xhigh)"' <<< "${efforts_src}" | tr -d '"' | sort -u)"
 for e in ${efforts}; do
-  grep -qF "\"${e}\"" <<< "${bridge}" || missing="${missing} ${e}"
+  grep -qF "\"${e}\"" <<< "${bridge}" || missing="${missing} effort:${e}"
 done
+# (2) every ResponseItem variant the bridge EXPLICITLY handles must still exist in codex's enum;
+# a rename would silently route it to the catch-all and break the agentic loop (e.g. lost tool output).
+response_item="$(sed -n '/pub enum ResponseItem/,/^}/p' <<< "${models_src}")"
+for v in Message Reasoning FunctionCall FunctionCallOutput; do
+  grep -qE "^[[:space:]]+${v}[[:space:]]*\{" <<< "${response_item}" || missing="${missing} input:${v}"
+done
+
 if [[ -n ${missing} ]]; then
-  printf 'DRIFT: codex efforts not handled by the bridge mirror:%s — update CodexEffort\n' "${missing}" >&2
+  printf 'DRIFT: codex types the bridge mirror no longer matches:%s — update the mirror\n' "${missing}" >&2
   exit 1
 fi
 echo ok
