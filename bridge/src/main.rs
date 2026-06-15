@@ -826,10 +826,12 @@ async fn handle_function_call(
     if !flush_reasoning(sender, state).await {
         return false;
     }
-    state.fcs.push((
-        function_call.name,
-        serde_json::to_string(&function_call.args).unwrap_or_else(|_| return "{}".into()),
-    ));
+    let arguments = if function_call.args.is_null() {
+        "{}".to_owned()
+    } else {
+        serde_json::to_string(&function_call.args).unwrap_or_else(|_| return "{}".into())
+    };
+    state.fcs.push((function_call.name, arguments));
     return true;
 }
 
