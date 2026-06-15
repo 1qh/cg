@@ -39,10 +39,14 @@ use tokio::{
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
-/// Reasoning-effort level codex requests.
-#[derive(Deserialize, Clone, Copy)]
-#[serde(rename_all = "lowercase")]
+/// Reasoning-effort level codex requests; a faithful mirror of codex's `ReasoningEffort`. Every
+/// value codex can send maps to a level, and an unrecognized one falls to `Custom`, so no effort
+/// value ever 422s the whole request. Kept faithful to codex by the source drift-check
+/// (`adr/typed-domain.md`).
+#[derive(Clone)]
 enum CodexEffort {
+    /// An effort value outside the known set; clamps to gemini `thinkingLevel` High.
+    Custom(String),
     /// Maps to gemini `thinkingLevel` High.
     High,
     /// Maps to gemini `thinkingLevel` Low.
@@ -51,11 +55,27 @@ enum CodexEffort {
     Medium,
     /// Maps to gemini `thinkingLevel` Minimal.
     Minimal,
-    /// Codex's "none" (reasoning off); clamps to gemini `thinkingLevel` Minimal. Codex DOES send
-    /// this, so omitting it 422'd the whole request.
+    /// Codex's "none" (reasoning off); clamps to gemini `thinkingLevel` Minimal.
     None,
     /// Codex's xhigh; gemini rejects it, so it clamps to `thinkingLevel` High.
     Xhigh,
+}
+impl<'de> Deserialize<'de> for CodexEffort {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        return Ok(match raw.as_str() {
+            "high" => Self::High,
+            "low" => Self::Low,
+            "medium" => Self::Medium,
+            "minimal" => Self::Minimal,
+            "none" => Self::None,
+            "xhigh" => Self::Xhigh,
+            _ => Self::Custom(raw),
+        });
+    }
 }
 /// Tagged union of codex per-turn input items.
 #[derive(Deserialize)]
@@ -444,12 +464,12 @@ fn build_contents(req: &CodexReq) -> Vec<Content> {
 }
 
 /// Map reasoning effort onto the gemini thinking level.
-const fn effort_level(effort: CodexEffort) -> ThinkingLevel {
+const fn effort_level(effort: &CodexEffort) -> ThinkingLevel {
     return match effort {
         CodexEffort::Minimal | CodexEffort::None => ThinkingLevel::Minimal,
         CodexEffort::Low => ThinkingLevel::Low,
         CodexEffort::Medium => ThinkingLevel::Medium,
-        CodexEffort::High | CodexEffort::Xhigh => ThinkingLevel::High,
+        CodexEffort::Custom(_) | CodexEffort::High | CodexEffort::Xhigh => ThinkingLevel::High,
     };
 }
 
@@ -482,7 +502,7 @@ fn build_request(client: &Gemini, req: &CodexReq, contents: Vec<Content>) -> Con
     });
     let mut thinking = ThinkingConfig::new().with_thoughts_included(true);
     if let Some(reasoning) = &req.reasoning
-        && let Some(effort) = reasoning.effort
+        && let Some(effort) = &reasoning.effort
     {
         thinking = thinking.with_thinking_level(effort_level(effort));
     }
