@@ -25,9 +25,10 @@ use axum::{
 };
 use futures::{StreamExt as _, stream::Stream};
 use gemini_rust::{
-    Blob, Candidate, Content, ContentBuilder, FinishReason, FunctionCall, FunctionDeclaration,
-    FunctionResponse, Gemini, GenerationStream, MediaResolution, MediaResolutionLevel, Model, Part,
-    Role, ThinkingConfig, ThinkingLevel, Tool as GTool, UsageMetadata, tools::ToolConfig,
+    Blob, Candidate, Content, ContentBuilder, FinishReason, FunctionCall, FunctionCallingConfig,
+    FunctionCallingMode, FunctionDeclaration, FunctionResponse, Gemini, GenerationStream,
+    MediaResolution, MediaResolutionLevel, Model, Part, Role, ThinkingConfig, ThinkingLevel,
+    Tool as GTool, UsageMetadata, tools::ToolConfig,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -147,6 +148,53 @@ enum CodexRole {
     #[serde(other)]
     Other,
 }
+/// Caller tool-choice control codex sends as a mode string or a forced named-function object.
+///
+/// gemini's `FunctionCallingConfig` carries only a mode (no named-function forcing), so a named
+/// object maps to `Any`. A manual deserialize accepts the string form, the object form, and any
+/// other shape so no `tool_choice` value ever 422s the request.
+enum CodexToolChoice {
+    /// `auto` (or unrecognized): the model chooses; maps to gemini `Auto`.
+    Auto,
+    /// A forced named-function object `{ type, name }`; maps to gemini `Any`.
+    Named,
+    /// `none`: the model must not call tools; maps to gemini `None`.
+    None,
+    /// `required`: the model must call a tool; maps to gemini `Any`.
+    Required,
+}
+impl<'de> Deserialize<'de> for CodexToolChoice {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = match Value::deserialize(deserializer) {
+            Ok(value) => value,
+            Err(error) => return Err(error),
+        };
+        if raw.is_object() {
+            return Ok(Self::Named);
+        }
+        return Ok(match raw.as_str() {
+            Some("none") => Self::None,
+            Some("required") => Self::Required,
+            _ => Self::Auto,
+        });
+    }
+
+    fn deserialize_in_place<D>(deserializer: D, place: &mut Self) -> Result<(), D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        match Self::deserialize(deserializer) {
+            Ok(value) => {
+                *place = value;
+                return Ok(());
+            },
+            Err(error) => return Err(error),
+        }
+    }
+}
 /// Tool kind codex declares.
 #[derive(Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -231,12 +279,18 @@ struct CodexReq {
     /// System instructions for the turn.
     #[serde(default)]
     instructions: Option<String>,
+    /// Caller cap on output tokens; honored onto the gemini builder.
+    #[serde(default)]
+    max_output_tokens: Option<i32>,
     /// Requested model id, defaulting when absent.
     #[serde(default)]
     model: Option<String>,
     /// Reasoning-effort control.
     #[serde(default)]
     reasoning: Option<CodexReasoning>,
+    /// Caller tool-choice control; maps to the gemini function-calling mode.
+    #[serde(default)]
+    tool_choice: Option<CodexToolChoice>,
     /// Function tools declared for the turn.
     #[serde(default)]
     tools: Vec<CodexTool>,
@@ -595,6 +649,43 @@ const fn effort_level(effort: &CodexEffort) -> ThinkingLevel {
     };
 }
 
+/// Map codex's `tool_choice` to a gemini function-calling mode; `None` leaves the gemini default.
+const fn tool_choice_mode(choice: Option<&CodexToolChoice>) -> Option<FunctionCallingMode> {
+    let mode = match choice {
+        None => return None,
+        Some(CodexToolChoice::Auto) => FunctionCallingMode::Auto,
+        Some(CodexToolChoice::Named | CodexToolChoice::Required) => FunctionCallingMode::Any,
+        Some(CodexToolChoice::None) => FunctionCallingMode::None,
+    };
+    return Some(mode);
+}
+
+/// The gemini function-tool declaration for one codex tool; `None` for a non-function tool.
+fn function_tool(tool: &CodexTool) -> Option<GTool> {
+    if tool.kind != CodexToolKind::Function {
+        return None;
+    }
+    let mut params = tool
+        .parameters
+        .clone()
+        .unwrap_or_else(|| return serde_json::json!({ "type": "object", "properties": {} }));
+    sanitize_schema(&mut params);
+    return Some(GTool::new(
+        FunctionDeclaration::new(&tool.name, &tool.description, None).with_parameters_value(params),
+    ));
+}
+
+/// The gemini thinking config for the request's reasoning effort (thoughts always included).
+fn thinking_config(req: &CodexReq) -> ThinkingConfig {
+    let mut thinking = ThinkingConfig::new().with_thoughts_included(true);
+    if let Some(reasoning) = &req.reasoning
+        && let Some(effort) = &reasoning.effort
+    {
+        thinking = thinking.with_thinking_level(effort_level(effort));
+    }
+    return thinking;
+}
+
 /// Build the gemini request builder from the codex request + reconstructed contents.
 fn build_request(client: &Gemini, req: &CodexReq, contents: Vec<Content>) -> ContentBuilder {
     let mut builder = client.generate_content();
@@ -602,34 +693,21 @@ fn build_request(client: &Gemini, req: &CodexReq, contents: Vec<Content>) -> Con
     if let Some(instructions) = &req.instructions {
         builder = builder.with_system_prompt(instructions.clone());
     }
-    for tool in &req.tools {
-        if tool.kind != CodexToolKind::Function {
-            continue;
-        }
-        let mut params = tool
-            .parameters
-            .clone()
-            .unwrap_or_else(|| return serde_json::json!({ "type": "object", "properties": {} }));
-        sanitize_schema(&mut params);
-        builder = builder.with_tool(GTool::new(
-            FunctionDeclaration::new(&tool.name, &tool.description, None)
-                .with_parameters_value(params),
-        ));
+    if let Some(max_output_tokens) = req.max_output_tokens {
+        builder = builder.with_max_output_tokens(max_output_tokens);
+    }
+    for tool in req.tools.iter().filter_map(function_tool) {
+        builder = builder.with_tool(tool);
     }
     builder = builder.with_tool(GTool::google_search());
     builder = builder.with_tool(GTool::url_context());
     builder = builder.with_tool_config(ToolConfig {
+        function_calling_config: tool_choice_mode(req.tool_choice.as_ref())
+            .map(|mode| return FunctionCallingConfig { mode }),
         include_server_side_tool_invocations: Some(true),
         ..ToolConfig::default()
     });
-    let mut thinking = ThinkingConfig::new().with_thoughts_included(true);
-    if let Some(reasoning) = &req.reasoning
-        && let Some(effort) = &reasoning.effort
-    {
-        thinking = thinking.with_thinking_level(effort_level(effort));
-    }
-    builder = builder.with_thinking_config(thinking);
-    return builder;
+    return builder.with_thinking_config(thinking_config(req));
 }
 
 /// Emit the two opening lifecycle events; returns false if the receiver closed.
