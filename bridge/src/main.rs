@@ -335,6 +335,16 @@ enum RsnEmitted {
     /// Reasoning item already emitted.
     Yes,
 }
+/// The terminal lifecycle a gemini finish reason maps to.
+enum TerminalOutcome {
+    /// A clean stop; emit `response.completed`.
+    Completed,
+    /// An abnormal termination (malformed/excess tool calls, unsupported language, unspecified
+    /// non-stop); emit `response.failed`.
+    Failed,
+    /// A bounded stop; emit `response.incomplete` with this reason.
+    Incomplete(&'static str),
+}
 /// Mutable accumulator threaded through the gemini stream loop.
 struct StreamState {
     /// Pending function calls (name, arguments).
@@ -1049,26 +1059,32 @@ async fn emit_function_call(
     return true;
 }
 
-/// Map the gemini finish reason onto the responses incomplete reason, if any.
-const fn incomplete_reason(finish: Option<&FinishReason>) -> Option<&'static str> {
+/// Map a gemini finish reason onto its responses terminal lifecycle.
+///
+/// A non-STOP finish must NEVER report `Completed`: a content block reports `content_filter`, a
+/// length cap reports `max_output_tokens`, and any other abnormal stop reports `Failed`. The match
+/// is exhaustive, so a new gemini variant breaks the build until it is categorized here.
+const fn finish_outcome(finish: Option<&FinishReason>) -> TerminalOutcome {
     return match finish {
-        Some(&FinishReason::MaxTokens) => Some("max_output_tokens"),
-        Some(&(FinishReason::Safety | FinishReason::Recitation | FinishReason::ImageSafety)) => {
-            Some("content_filter")
+        None | Some(&(FinishReason::FinishReasonUnspecified | FinishReason::Stop)) => {
+            TerminalOutcome::Completed
         },
+        Some(&FinishReason::MaxTokens) => TerminalOutcome::Incomplete("max_output_tokens"),
         Some(
-            &(FinishReason::FinishReasonUnspecified
-            | FinishReason::Stop
-            | FinishReason::Language
-            | FinishReason::Other
-            | FinishReason::Blocklist
+            &(FinishReason::Blocklist
+            | FinishReason::ImageSafety
             | FinishReason::ProhibitedContent
-            | FinishReason::Spii
+            | FinishReason::Recitation
+            | FinishReason::Safety
+            | FinishReason::Spii),
+        ) => TerminalOutcome::Incomplete("content_filter"),
+        Some(
+            &(FinishReason::Language
             | FinishReason::MalformedFunctionCall
-            | FinishReason::UnexpectedToolCall
-            | FinishReason::TooManyToolCalls),
-        )
-        | None => None,
+            | FinishReason::Other
+            | FinishReason::TooManyToolCalls
+            | FinishReason::UnexpectedToolCall),
+        ) => TerminalOutcome::Failed,
     };
 }
 
@@ -1080,34 +1096,35 @@ async fn emit_terminal(
 ) {
     let out_items = take(&mut state.out_items);
     let usage = state.usage.take();
-    if state.got_finish == FinishObserved::No {
-        state.seq = state.seq.wrapping_add(1);
-        let failed = ResponseStreamEvent::ResponseFailed(ResponseFailedEvent {
+    let outcome = if state.got_finish == FinishObserved::No {
+        TerminalOutcome::Failed
+    } else {
+        finish_outcome(state.finish.as_ref())
+    };
+    state.seq = state.seq.wrapping_add(1);
+    let event = match outcome {
+        TerminalOutcome::Completed => {
+            ResponseStreamEvent::ResponseCompleted(ResponseCompletedEvent {
+                sequence_number: state.seq,
+                response: make_response(meta, Status::Completed, out_items, usage),
+            })
+        },
+        TerminalOutcome::Failed => ResponseStreamEvent::ResponseFailed(ResponseFailedEvent {
             sequence_number: state.seq,
             response: make_response(meta, Status::Failed, out_items, usage),
-        });
-        discard(sender.send(Ok(to_event(&failed))).await);
-        return;
-    }
-    if let Some(reason) = incomplete_reason(state.finish.as_ref()) {
-        let mut resp = make_response(meta, Status::Incomplete, out_items, usage);
-        resp.incomplete_details = Some(IncompleteDetails {
-            reason: reason.into(),
-        });
-        state.seq = state.seq.wrapping_add(1);
-        let incomplete = ResponseStreamEvent::ResponseIncomplete(ResponseIncompleteEvent {
-            sequence_number: state.seq,
-            response: resp,
-        });
-        discard(sender.send(Ok(to_event(&incomplete))).await);
-        return;
-    }
-    state.seq = state.seq.wrapping_add(1);
-    let completed = ResponseStreamEvent::ResponseCompleted(ResponseCompletedEvent {
-        sequence_number: state.seq,
-        response: make_response(meta, Status::Completed, out_items, usage),
-    });
-    discard(sender.send(Ok(to_event(&completed))).await);
+        }),
+        TerminalOutcome::Incomplete(reason) => {
+            let mut resp = make_response(meta, Status::Incomplete, out_items, usage);
+            resp.incomplete_details = Some(IncompleteDetails {
+                reason: reason.into(),
+            });
+            ResponseStreamEvent::ResponseIncomplete(ResponseIncompleteEvent {
+                sequence_number: state.seq,
+                response: resp,
+            })
+        },
+    };
+    discard(sender.send(Ok(to_event(&event))).await);
 }
 
 /// Send a terminal `response.failed` carrying the given sequence number.
