@@ -899,17 +899,26 @@ async fn handle_part(
 }
 
 /// Map gemini usage metadata into the responses usage shape.
+/// A gemini token count (`Option<i32>`) as a saturating `u32`.
+fn token_count(value: Option<i32>) -> u32 {
+    return u32::try_from(value.unwrap_or(0)).unwrap_or(0);
+}
+
+/// Map gemini usage onto codex `ResponseUsage` with `OpenAI` semantics.
+///
+/// gemini's `candidates_token_count` EXCLUDES thinking tokens (`total = prompt + candidates +
+/// thoughts`), but `OpenAI`'s `output_tokens` INCLUDES `reasoning_tokens`; so output is
+/// candidates+thoughts, keeping reasoning a subset of output and `input + output == total`.
 fn map_usage(meta: &UsageMetadata) -> ResponseUsage {
+    let reasoning_tokens = token_count(meta.thoughts_token_count);
     return ResponseUsage {
-        input_tokens: u32::try_from(meta.prompt_token_count.unwrap_or(0)).unwrap_or(0),
+        input_tokens: token_count(meta.prompt_token_count),
         input_tokens_details: InputTokenDetails {
-            cached_tokens: u32::try_from(meta.cached_content_token_count.unwrap_or(0)).unwrap_or(0),
+            cached_tokens: token_count(meta.cached_content_token_count),
         },
-        output_tokens: u32::try_from(meta.candidates_token_count.unwrap_or(0)).unwrap_or(0),
-        output_tokens_details: OutputTokenDetails {
-            reasoning_tokens: u32::try_from(meta.thoughts_token_count.unwrap_or(0)).unwrap_or(0),
-        },
-        total_tokens: u32::try_from(meta.total_token_count.unwrap_or(0)).unwrap_or(0),
+        output_tokens: token_count(meta.candidates_token_count).saturating_add(reasoning_tokens),
+        output_tokens_details: OutputTokenDetails { reasoning_tokens },
+        total_tokens: token_count(meta.total_token_count),
     };
 }
 
