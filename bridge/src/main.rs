@@ -1241,35 +1241,47 @@ async fn stream_responses(
 }
 
 /// Codex `/v1/responses` handler: translate to gemini, stream typed responses events.
+/// Spawn a task emitting a single `response.failed` for a request rejected before streaming starts.
+fn spawn_failed(sender: Sender<Result<Event, Infallible>>, response_id: String, model: String) {
+    discard(tokio::spawn(Box::pin(async move {
+        let meta = RespMeta {
+            model: &model,
+            response_id: &response_id,
+        };
+        send_failed(&sender, meta, 1_u64).await;
+    })));
+}
+
+/// Codex `/v1/responses` handler: translate to gemini, stream typed responses events.
 async fn responses(
     State(state): State<AppState>,
     Json(req): Json<CodexReq>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let model = req
+    let (sender, receiver) = channel::<Result<Event, Infallible>>(64);
+    let response_id = format!("resp_{}", Uuid::new_v4().simple());
+    let Some(model) = req
         .model
         .clone()
-        .unwrap_or_else(|| return "gemini-3.5-flash".into());
+        .filter(|requested| return !requested.is_empty())
+    else {
+        discard(writeln!(
+            stderr(),
+            "request rejected: no model (no fallback)"
+        ));
+        spawn_failed(sender, response_id, String::new());
+        return Sse::new(ReceiverStream::new(receiver));
+    };
     let contents = build_contents(&req);
     let api_model = if model.starts_with("models/") {
         model.clone()
     } else {
         format!("models/{model}")
     };
-    let (sender, receiver) = channel::<Result<Event, Infallible>>(64);
-    let response_id = format!("resp_{}", Uuid::new_v4().simple());
-
     let Ok(client) = Gemini::with_model(state.api_key, Model::Custom(api_model)) else {
-        discard(tokio::spawn(Box::pin(async move {
-            let meta = RespMeta {
-                model: &model,
-                response_id: &response_id,
-            };
-            send_failed(&sender, meta, 1_u64).await;
-        })));
+        spawn_failed(sender, response_id, model);
         return Sse::new(ReceiverStream::new(receiver));
     };
     let builder = build_request(&client, &req, contents);
-
     discard(tokio::spawn(Box::pin(async move {
         let meta = RespMeta {
             model: &model,
