@@ -39,6 +39,12 @@ image_detail="$(sed -n '/pub enum ImageDetail/,/^}/p' <<< "${models_src}")"
 for v in Auto High Low Original; do
   grep -qE "^[[:space:]]+${v}," <<< "${image_detail}" || missing="${missing} detail:${v}"
 done
+# (5) function_call_output.output is codex's untagged FunctionCallOutputBody (string OR content items);
+# the bridge mirrors both forms — a renamed variant would silently fail to parse the array form (422).
+output_body="$(sed -n '/pub enum FunctionCallOutputBody/,/^}/p' <<< "${models_src}")"
+for v in Text ContentItems; do
+  grep -qE "^[[:space:]]+${v}" <<< "${output_body}" || missing="${missing} outputbody:${v}"
+done
 
 if [[ -n ${missing} ]]; then
   printf 'DRIFT: codex types the bridge mirror no longer matches:%s — update the mirror\n' "${missing}" >&2
