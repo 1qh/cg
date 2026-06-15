@@ -1,12 +1,11 @@
 //! MAX-TYPESAFE bridge: async-openai `CreateResponse` (typed request) -> gemini-rust (typed gemini)
 //! -> async-openai `ResponseStreamEvent` (typed emit). No raw `serde_json::Value` for
 //! request/response shapes.
-use core::{convert::Infallible, mem::take};
+use core::{convert::Infallible, mem::take, time::Duration};
 use std::{
     collections::HashMap,
     env::var,
     io::{Write as _, stderr},
-    time::Duration,
 };
 
 use async_openai::types::responses::{
@@ -35,18 +34,20 @@ use serde_json::Value;
 use tokio::{
     net::TcpListener,
     sync::mpsc::{Sender, channel},
+    time::timeout,
 };
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
-/// Reasoning-effort level codex requests; a faithful mirror of codex's `ReasoningEffort`. Every
-/// value codex can send maps to a level, and an unrecognized one falls to `Custom`, so no effort
-/// value ever 422s the whole request. Kept faithful to codex by the source drift-check
+/// Reasoning-effort level codex requests; a faithful mirror of codex's `ReasoningEffort`.
+///
+/// Every value codex can send maps to a level, and an unrecognized one falls to `Custom`, so no
+/// effort value ever 422s the whole request. Kept faithful to codex by the source drift-check
 /// (`adr/typed-domain.md`).
 #[derive(Clone)]
 enum CodexEffort {
     /// An effort value outside the known set; clamps to gemini `thinkingLevel` High.
-    Custom(String),
+    Custom,
     /// Maps to gemini `thinkingLevel` High.
     High,
     /// Maps to gemini `thinkingLevel` Low.
@@ -65,7 +66,10 @@ impl<'de> Deserialize<'de> for CodexEffort {
     where
         D: serde::Deserializer<'de>,
     {
-        let raw = String::deserialize(deserializer)?;
+        let raw = match String::deserialize(deserializer) {
+            Ok(value) => value,
+            Err(error) => return Err(error),
+        };
         return Ok(match raw.as_str() {
             "high" => Self::High,
             "low" => Self::Low,
@@ -73,8 +77,21 @@ impl<'de> Deserialize<'de> for CodexEffort {
             "minimal" => Self::Minimal,
             "none" => Self::None,
             "xhigh" => Self::Xhigh,
-            _ => Self::Custom(raw),
+            _ => Self::Custom,
         });
+    }
+
+    fn deserialize_in_place<D>(deserializer: D, place: &mut Self) -> Result<(), D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        match Self::deserialize(deserializer) {
+            Ok(value) => {
+                *place = value;
+                return Ok(());
+            },
+            Err(error) => return Err(error),
+        }
     }
 }
 /// Tagged union of codex per-turn input items.
@@ -357,20 +374,28 @@ fn sanitize_schema(value: &mut Value) {
     }
 }
 
-/// Build the gemini contents one message item contributes.
+/// Parse a codex `input_image` value into a gemini inline-data blob.
 ///
-/// Parse a codex `input_image` value (a `data:<mime>;base64,<data>` URL string, or `{ url }`) into
-/// a gemini inline-data blob; `None` when it is not a base64 data URL.
+/// Accepts a `data:<mime>;base64,<data>` URL string or a `{ url }` object; `None` when the value is
+/// not a base64 data URL.
 fn image_blob(image_url: &Value) -> Option<Blob> {
-    let url = image_url
+    let Some(url) = image_url
         .as_str()
-        .or_else(|| return image_url.get("url").and_then(Value::as_str))?;
-    let rest = url.strip_prefix("data:")?;
-    let (mime, b64) = rest.split_once(";base64,")?;
+        .or_else(|| return image_url.get("url").and_then(Value::as_str))
+    else {
+        return None;
+    };
+    let Some(rest) = url.strip_prefix("data:") else {
+        return None;
+    };
+    let Some((mime, b64)) = rest.split_once(";base64,") else {
+        return None;
+    };
     return Some(Blob::new(mime, b64));
 }
 
-fn push_message(contents: &mut Vec<Content>, role: &CodexRole, content: &[CodexContent]) {
+/// Build the gemini parts (text + inline image) one codex message's content contributes.
+fn message_parts(content: &[CodexContent]) -> Vec<Part> {
     let mut parts: Vec<Part> = Vec::new();
     for item in content {
         if let Some(text) = &item.text
@@ -391,6 +416,12 @@ fn push_message(contents: &mut Vec<Content>, role: &CodexRole, content: &[CodexC
             });
         }
     }
+    return parts;
+}
+
+/// Push the gemini content one codex message item contributes (text plus any inline image).
+fn push_message(contents: &mut Vec<Content>, role: &CodexRole, content: &[CodexContent]) {
+    let parts = message_parts(content);
     if parts.is_empty() {
         return;
     }
@@ -504,7 +535,7 @@ const fn effort_level(effort: &CodexEffort) -> ThinkingLevel {
         CodexEffort::Minimal | CodexEffort::None => ThinkingLevel::Minimal,
         CodexEffort::Low => ThinkingLevel::Low,
         CodexEffort::Medium => ThinkingLevel::Medium,
-        CodexEffort::Custom(_) | CodexEffort::High | CodexEffort::Xhigh => ThinkingLevel::High,
+        CodexEffort::Custom | CodexEffort::High | CodexEffort::Xhigh => ThinkingLevel::High,
     };
 }
 
@@ -996,6 +1027,41 @@ async fn drive_stream(
     }
 }
 
+/// Establish the gemini stream under a connect deadline; emit `response.failed` and return `None`
+/// when the connect times out or errors.
+async fn open_gemini_stream(
+    builder: ContentBuilder,
+    sender: &Sender<Result<Event, Infallible>>,
+    state: &mut StreamState,
+    meta: RespMeta<'_>,
+) -> Option<GenerationStream> {
+    let connect = timeout(Duration::from_mins(1), Box::pin(builder.execute_stream()));
+    let Ok(Ok(stream)) = connect.await else {
+        state.seq = state.seq.wrapping_add(1);
+        send_failed(sender, meta, state.seq).await;
+        return None;
+    };
+    return Some(stream);
+}
+
+/// Drive the established stream under an overall deadline; emit `response.failed` on a mid-stream
+/// stall.
+async fn drive_with_deadline(
+    sender: &Sender<Result<Event, Infallible>>,
+    state: &mut StreamState,
+    stream: GenerationStream,
+    meta: RespMeta<'_>,
+) {
+    let drive = timeout(
+        Duration::from_mins(5),
+        Box::pin(drive_stream(sender, state, stream, meta)),
+    );
+    if drive.await.is_err() {
+        state.seq = state.seq.wrapping_add(1);
+        send_failed(sender, meta, state.seq).await;
+    }
+}
+
 /// Drive the gemini stream and emit the typed responses event sequence.
 async fn stream_responses(
     builder: ContentBuilder,
@@ -1006,20 +1072,10 @@ async fn stream_responses(
     if !emit_open(&sender, &mut state, meta).await {
         return;
     }
-    let connect = tokio::time::timeout(Duration::from_mins(1), Box::pin(builder.execute_stream()));
-    let Ok(Ok(stream)) = connect.await else {
-        state.seq = state.seq.wrapping_add(1);
-        send_failed(&sender, meta, state.seq).await;
+    let Some(stream) = open_gemini_stream(builder, &sender, &mut state, meta).await else {
         return;
     };
-    let drive = tokio::time::timeout(
-        Duration::from_mins(5),
-        Box::pin(drive_stream(&sender, &mut state, stream, meta)),
-    );
-    if drive.await.is_err() {
-        state.seq = state.seq.wrapping_add(1);
-        send_failed(&sender, meta, state.seq).await;
-    }
+    drive_with_deadline(&sender, &mut state, stream, meta).await;
 }
 
 /// Codex `/v1/responses` handler: translate to gemini, stream typed responses events.
