@@ -169,7 +169,7 @@ fn model(
         support_verbosity: true,
         supported_in_api: true,
         supported_reasoning_levels: reasoning_levels(),
-        supports_image_detail_original: false,
+        supports_image_detail_original: true,
         supports_parallel_tool_calls: true,
         supports_reasoning_summaries: true,
         supports_search_tool: true,

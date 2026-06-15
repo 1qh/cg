@@ -1,7 +1,7 @@
 //! MAX-TYPESAFE bridge: async-openai `CreateResponse` (typed request) -> gemini-rust (typed gemini)
 //! -> async-openai `ResponseStreamEvent` (typed emit). No raw `serde_json::Value` for
 //! request/response shapes.
-use core::{convert::Infallible, mem::take, time::Duration};
+use core::{convert::Infallible, iter::once, mem::take, time::Duration};
 use std::{
     collections::HashMap,
     env::var,
@@ -117,9 +117,9 @@ enum CodexInput {
         /// Correlation id pairing output with call.
         #[serde(default)]
         call_id: String,
-        /// Tool output payload.
+        /// Tool output payload: a plain string OR an array of structured content items.
         #[serde(default)]
-        output: String,
+        output: CodexOutput,
     },
     /// A user/assistant/system/developer message.
     Message {
@@ -264,6 +264,43 @@ enum CodexImageDetail {
     #[serde(other)]
     Unknown,
 }
+/// A prior function-call output: a plain string OR structured content items.
+///
+/// A faithful mirror of codex's untagged `FunctionCallOutputBody`; modelling only the string form
+/// (as `String`) 422s the WHOLE request when a tool returns structured/image content.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CodexOutput {
+    /// The structured content-items output form.
+    Items(Vec<CodexOutputItem>),
+    /// The plain-string output form.
+    Text(String),
+}
+impl Default for CodexOutput {
+    fn default() -> Self {
+        return Self::Text(String::new());
+    }
+}
+/// One structured function-call output content item.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum CodexOutputItem {
+    /// Image output: a data/http URL.
+    InputImage {
+        /// The image URL.
+        #[serde(default)]
+        image_url: String,
+    },
+    /// Text output.
+    InputText {
+        /// Text body.
+        #[serde(default)]
+        text: String,
+    },
+    /// Any unrecognized output item kind.
+    #[serde(other)]
+    Unknown,
+}
 /// Reasoning control block.
 #[derive(Deserialize)]
 struct CodexReasoning {
@@ -311,6 +348,9 @@ struct CodexTool {
     /// JSON-schema parameters.
     #[serde(default)]
     parameters: Option<Value>,
+    /// Nested function tools for a `namespace` group (multi-agent / MCP); empty for a leaf tool.
+    #[serde(default)]
+    tools: Vec<Self>,
 }
 /// Whether a finish reason has been observed on the stream.
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -458,7 +498,13 @@ fn make_response(
 
 /// Serialize an event to SSE; on serialize failure emit empty data.
 fn to_event(event: &ResponseStreamEvent) -> Event {
-    let data = serde_json::to_string(event).unwrap_or_default();
+    let data = match serde_json::to_string(event) {
+        Ok(json) => json,
+        Err(error) => {
+            discard(writeln!(stderr(), "event serialize failed: {error}"));
+            String::new()
+        },
+    };
     return Event::default().data(data);
 }
 
@@ -547,7 +593,16 @@ fn push_function_call(
     name: &str,
     arguments: &str,
 ) {
-    let args: Value = serde_json::from_str(arguments).unwrap_or_default();
+    let args: Value = match serde_json::from_str(arguments) {
+        Ok(value) => value,
+        Err(error) => {
+            discard(writeln!(
+                stderr(),
+                "replayed function-call args parse failed: {error}"
+            ));
+            Value::Null
+        },
+    };
     let sig = pending_sig
         .take()
         .unwrap_or_else(|| return "skip_thought_signature_validator".into());
@@ -555,6 +610,25 @@ fn push_function_call(
         Content::function_call_with_thought(FunctionCall::new(name, args), sig)
             .with_role(Role::Model),
     );
+}
+
+/// Flatten a function-call output (string or content items) to the text the gemini response
+/// carries.
+fn flatten_output(output: &CodexOutput) -> String {
+    return match output {
+        CodexOutput::Text(text) => text.clone(),
+        CodexOutput::Items(items) => items
+            .iter()
+            .filter_map(|item| {
+                return match item {
+                    CodexOutputItem::InputText { text } => Some(text.clone()),
+                    CodexOutputItem::InputImage { image_url } => Some(image_url.clone()),
+                    CodexOutputItem::Unknown => None,
+                };
+            })
+            .collect::<Vec<String>>()
+            .join("\n"),
+    };
 }
 
 /// Push a prior function-call output, keyed back to the call name, onto the contents.
@@ -565,7 +639,7 @@ fn push_function_output(
     contents: &mut Vec<Content>,
     names: &HashMap<String, String>,
     call_id: &str,
-    output: &str,
+    output: &CodexOutput,
 ) {
     let Some(name) = names.get(call_id) else {
         return;
@@ -573,7 +647,7 @@ fn push_function_output(
     contents.push(
         Content::function_response(FunctionResponse::new(
             name.clone(),
-            serde_json::json!({ "output": output }),
+            serde_json::json!({ "output": flatten_output(output) }),
         ))
         .with_role(Role::User),
     );
@@ -671,6 +745,19 @@ fn function_tool(tool: &CodexTool) -> Option<GTool> {
     ));
 }
 
+/// Flatten codex's tool list to gemini function tools, descending into `namespace` groups.
+///
+/// codex groups multi-agent / MCP tools under a `namespace` entry whose `tools[]` hold the real
+/// function declarations; a flat scan that only reads top-level `function` tools silently drops
+/// them.
+fn function_tools(tools: &[CodexTool]) -> Vec<GTool> {
+    return tools
+        .iter()
+        .flat_map(|tool| return once(tool).chain(tool.tools.iter()))
+        .filter_map(function_tool)
+        .collect();
+}
+
 /// The gemini thinking config for the request's reasoning effort (thoughts always included).
 fn thinking_config(req: &CodexReq) -> ThinkingConfig {
     let mut thinking = ThinkingConfig::new().with_thoughts_included(true);
@@ -692,7 +779,7 @@ fn build_request(client: &Gemini, req: &CodexReq, contents: Vec<Content>) -> Con
     if let Some(max_output_tokens) = req.max_output_tokens {
         builder = builder.with_max_output_tokens(max_output_tokens);
     }
-    for tool in req.tools.iter().filter_map(function_tool) {
+    for tool in function_tools(&req.tools) {
         builder = builder.with_tool(tool);
     }
     builder = builder.with_tool(GTool::google_search());
@@ -832,13 +919,27 @@ async fn handle_function_call(
     if !flush_reasoning(sender, state).await {
         return false;
     }
-    let arguments = if function_call.args.is_null() {
-        "{}".to_owned()
-    } else {
-        serde_json::to_string(&function_call.args).unwrap_or_else(|_| return "{}".into())
-    };
+    let arguments = fc_args_string(&function_call.args);
     state.fcs.push((function_call.name, arguments));
     return true;
+}
+
+/// Serialize gemini function-call args to a JSON object string; null/failure -> `{}` (codex needs
+/// an object).
+fn fc_args_string(args: &Value) -> String {
+    if args.is_null() {
+        return "{}".to_owned();
+    }
+    return match serde_json::to_string(args) {
+        Ok(json) => json,
+        Err(error) => {
+            discard(writeln!(
+                stderr(),
+                "function-call args serialize failed: {error}"
+            ));
+            "{}".to_owned()
+        },
+    };
 }
 
 /// Process one gemini part; returns false if the receiver closed.
