@@ -164,16 +164,34 @@ struct AppState {
     /// Gemini API key.
     api_key: String,
 }
-/// One content part of a codex message.
+/// One content part of a codex message; a faithful tagged mirror of codex's `ContentItem`.
+///
+/// Kept faithful to codex by the source drift-check (`adr/typed-domain.md`); an unrecognized kind
+/// falls to `Unknown` so a new content kind never 422s the whole request.
 #[derive(Deserialize)]
-struct CodexContent {
-    /// An `input_image` value (a `data:` URL string, or `{ url }`); maps to a gemini inline-data
-    /// part.
-    #[serde(default)]
-    image_url: Option<Value>,
-    /// Text body of the part.
-    #[serde(default)]
-    text: Option<String>,
+#[serde(tag = "type", rename_all = "snake_case")]
+enum CodexContent {
+    /// An image part: a `data:<mime>;base64,<data>` URL; maps to a gemini inline-data part.
+    InputImage {
+        /// The image data URL codex emits via `into_data_url()`.
+        #[serde(default)]
+        image_url: String,
+    },
+    /// A user/system/developer text part.
+    InputText {
+        /// Text body.
+        #[serde(default)]
+        text: String,
+    },
+    /// A replayed assistant text part.
+    OutputText {
+        /// Text body.
+        #[serde(default)]
+        text: String,
+    },
+    /// Any unrecognized content kind.
+    #[serde(other)]
+    Unknown,
 }
 /// Reasoning control block.
 #[derive(Deserialize)]
@@ -374,18 +392,10 @@ fn sanitize_schema(value: &mut Value) {
     }
 }
 
-/// Parse a codex `input_image` value into a gemini inline-data blob.
-///
-/// Accepts a `data:<mime>;base64,<data>` URL string or a `{ url }` object; `None` when the value is
-/// not a base64 data URL.
-fn image_blob(image_url: &Value) -> Option<Blob> {
-    let Some(url) = image_url
-        .as_str()
-        .or_else(|| return image_url.get("url").and_then(Value::as_str))
-    else {
-        return None;
-    };
-    let Some(rest) = url.strip_prefix("data:") else {
+/// Parse a codex image-content `image_url` (`data:<mime>;base64,<data>`) into a gemini inline-data
+/// blob; `None` when it is not a base64 data URL.
+fn image_blob(image_url: &str) -> Option<Blob> {
+    let Some(rest) = image_url.strip_prefix("data:") else {
         return None;
     };
     let Some((mime, b64)) = rest.split_once(";base64,") else {
@@ -394,29 +404,33 @@ fn image_blob(image_url: &Value) -> Option<Blob> {
     return Some(Blob::new(mime, b64));
 }
 
-/// Build the gemini parts (text + inline image) one codex message's content contributes.
-fn message_parts(content: &[CodexContent]) -> Vec<Part> {
-    let mut parts: Vec<Part> = Vec::new();
-    for item in content {
-        if let Some(text) = &item.text
-            && !text.is_empty()
-        {
-            parts.push(Part::Text {
-                text: text.clone(),
-                thought: None,
-                thought_signature: None,
-            });
-        }
-        if let Some(image_url) = &item.image_url
-            && let Some(inline_data) = image_blob(image_url)
-        {
-            parts.push(Part::InlineData {
+/// The gemini part one codex content item contributes (text, inline image, or nothing).
+fn content_part(item: &CodexContent) -> Option<Part> {
+    return match item {
+        CodexContent::InputImage { image_url } => image_blob(image_url).map(|inline_data| {
+            return Part::InlineData {
                 inline_data,
                 media_resolution: None,
-            });
-        }
-    }
-    return parts;
+            };
+        }),
+        CodexContent::InputText { text } | CodexContent::OutputText { text } => {
+            if text.is_empty() {
+                None
+            } else {
+                Some(Part::Text {
+                    text: text.clone(),
+                    thought: None,
+                    thought_signature: None,
+                })
+            }
+        },
+        CodexContent::Unknown => None,
+    };
+}
+
+/// Build the gemini parts (text + inline image) one codex message's content contributes.
+fn message_parts(content: &[CodexContent]) -> Vec<Part> {
+    return content.iter().filter_map(content_part).collect();
 }
 
 /// Push the gemini content one codex message item contributes (text plus any inline image).

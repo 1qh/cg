@@ -25,6 +25,14 @@ response_item="$(sed -n '/pub enum ResponseItem/,/^}/p' <<< "${models_src}")"
 for v in Message Reasoning FunctionCall FunctionCallOutput; do
   grep -qE "^[[:space:]]+${v}[[:space:]]*\{" <<< "${response_item}" || missing="${missing} input:${v}"
 done
+# (3) every ContentItem variant the bridge mirrors must still exist with its load-bearing field;
+# a renamed variant/field silently drops text or images (the class of the image-input regression).
+content_item="$(sed -n '/pub enum ContentItem/,/^}/p' <<< "${models_src}")"
+for v in InputText InputImage OutputText; do
+  grep -qE "^[[:space:]]+${v}[[:space:]]*\{" <<< "${content_item}" || missing="${missing} content:${v}"
+done
+grep -qE "^[[:space:]]+image_url:" <<< "${content_item}" || missing="${missing} content-field:image_url"
+grep -qE "^[[:space:]]+text:" <<< "${content_item}" || missing="${missing} content-field:text"
 
 if [[ -n ${missing} ]]; then
   printf 'DRIFT: codex types the bridge mirror no longer matches:%s — update the mirror\n' "${missing}" >&2
