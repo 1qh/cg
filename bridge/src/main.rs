@@ -6,6 +6,7 @@ use std::{
     collections::HashMap,
     env::var,
     io::{Write as _, stderr},
+    time::Duration,
 };
 
 use async_openai::types::responses::{
@@ -947,12 +948,20 @@ async fn stream_responses(
     if !emit_open(&sender, &mut state, meta).await {
         return;
     }
-    let Ok(stream) = Box::pin(builder.execute_stream()).await else {
+    let connect = tokio::time::timeout(Duration::from_mins(1), Box::pin(builder.execute_stream()));
+    let Ok(Ok(stream)) = connect.await else {
         state.seq = state.seq.wrapping_add(1);
         send_failed(&sender, meta, state.seq).await;
         return;
     };
-    Box::pin(drive_stream(&sender, &mut state, stream, meta)).await;
+    let drive = tokio::time::timeout(
+        Duration::from_mins(5),
+        Box::pin(drive_stream(&sender, &mut state, stream, meta)),
+    );
+    if drive.await.is_err() {
+        state.seq = state.seq.wrapping_add(1);
+        send_failed(&sender, meta, state.seq).await;
+    }
 }
 
 /// Codex `/v1/responses` handler: translate to gemini, stream typed responses events.
