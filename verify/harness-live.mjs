@@ -101,7 +101,9 @@ test(`harness capability suite (${MODEL})`, { timeout: 480000 }, async () => {
     ck("goals set+get", !g?.__e && JSON.stringify(gg).includes("Ship the widget"));
 
     const fk = await send("thread/fork", { threadId: A }); // fork a thread WITH turn history, not a turnless one
-    ck("fork", !fk?.__e && (JSON.stringify(fk).includes("forkedFrom") || !!fk?.thread?.id));
+    const forkedId = fk?.thread?.id ?? fk?.threadId;
+    // red-capable: a real fork yields a NEW thread id distinct from the parent (not an echo / same thread)
+    ck("fork creates a distinct thread", !fk?.__e && (JSON.stringify(fk).includes("forkedFrom") || (!!forkedId && forkedId !== A)), `forked=${forkedId} parent=${A}`);
 
     const E = await newThread();
     done = false; failed = null; msg = "";

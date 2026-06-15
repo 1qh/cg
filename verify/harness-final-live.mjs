@@ -45,7 +45,7 @@ test(`final harness: model list, error surfacing, sandbox enforcement (${MODEL})
 
     // model listing
     const ml = await send("model/list", {});
-    ck("model/list returns models", !ml?.__e && JSON.stringify(ml).length > 5, JSON.stringify(ml).slice(0, 50));
+    ck("model/list returns the registered model", !ml?.__e && JSON.stringify(ml).includes(MODEL), JSON.stringify(ml).slice(0, 80));
 
     // structured error surfacing — a connection failure (bridge at a dead port) must FAIL cleanly, not hang
     const errOut = await new Promise((resolve) => {

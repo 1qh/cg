@@ -81,7 +81,8 @@ test(`advanced harness: approval accept/decline, parallel tools, abort (${MODEL}
     await new Promise(r => setTimeout(r, 4000));
     const ab = await send("turn/interrupt", { threadId: D, turnId: activeTurn });
     const t0 = Date.now(); while (!done && Date.now() - t0 < 20000) await new Promise(r => setTimeout(r, 300));
-    ck("abort/interrupt stops the turn", !ab?.__e && (Date.now() - t0) < 20000, ab?.__e ? "interrupt err" : "stopped");
+    // red-capable: the interrupt must cut the turn BEFORE it finishes its sleep+DONE, so DONE never appears
+    ck("abort/interrupt cuts the turn before natural completion", !ab?.__e && (Date.now() - t0) < 20000 && !/DONE/.test(buf), ab?.__e ? "interrupt err" : (/DONE/.test(buf) ? "turn completed naturally — NOT interrupted" : "cut before DONE"));
 
     const passed = results.filter(r => r.p).length;
     for (const r of results) console.log(`  ${r.p ? "PASS" : "FAIL"} ${r.n}${r.d ? " ("+r.d+")" : ""}`);

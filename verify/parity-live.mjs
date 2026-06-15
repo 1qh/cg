@@ -70,7 +70,9 @@ test(`parity on ${MODEL}: multi-step coding + grounding via the real bridge`, { 
 
     const grd = await api.run(threadId, "Who won the most recent Formula 1 Grand Prix? Use web search, then state the winner's name only.", 120000);
     assert.ok(!grd.failed, `grounding turn failed: ${grd.failed}`);
-    assert.ok((grd.msg || "").trim().length > 0, "grounding turn must produce a non-empty answer (web grounding path)");
+    const ans = (grd.msg || "").trim();
+    // red-capable: the grounded answer must NAME a winner (a capitalized name token) and not be a refusal/no-search
+    assert.ok(/[A-Z][a-z]+/.test(ans) && !/\b(cannot|can't|unable|do(?:es)? ?n['o]t (?:have|know)|no (?:web|internet|search) access)\b/i.test(ans), `grounding answer must name a winner via web search, got: ${JSON.stringify(ans.slice(0, 80))}`);
     console.log(`  ${MODEL}: 3/3 files | grounding answer=${JSON.stringify((grd.msg || "").slice(0, 60))}`);
   } finally {
     api?.kill();
