@@ -1191,8 +1191,19 @@ async fn drive_stream(
     }
 }
 
-/// Establish the gemini stream under a connect deadline; emit `response.failed` and return `None`
-/// when the connect times out or errors.
+/// Emit `response.failed` for a stream that never opened; returns `None` to short-circuit the
+/// caller.
+async fn fail_stream(
+    sender: &Sender<Result<Event, Infallible>>,
+    state: &mut StreamState,
+    meta: RespMeta<'_>,
+) -> Option<GenerationStream> {
+    state.seq = state.seq.wrapping_add(1);
+    send_failed(sender, meta, state.seq).await;
+    return None;
+}
+
+/// Establish the gemini stream under a connect deadline, surfacing the specific failure reason.
 async fn open_gemini_stream(
     builder: ContentBuilder,
     sender: &Sender<Result<Event, Infallible>>,
@@ -1200,10 +1211,16 @@ async fn open_gemini_stream(
     meta: RespMeta<'_>,
 ) -> Option<GenerationStream> {
     let connect = timeout(Duration::from_mins(1), Box::pin(builder.execute_stream()));
-    let Ok(Ok(stream)) = connect.await else {
-        state.seq = state.seq.wrapping_add(1);
-        send_failed(sender, meta, state.seq).await;
-        return None;
+    let stream = match connect.await {
+        Ok(Ok(opened)) => opened,
+        Ok(Err(error)) => {
+            discard(writeln!(stderr(), "gemini connect error: {error}"));
+            return fail_stream(sender, state, meta).await;
+        },
+        Err(_elapsed) => {
+            discard(writeln!(stderr(), "gemini connect timeout 60s"));
+            return fail_stream(sender, state, meta).await;
+        },
     };
     return Some(stream);
 }
