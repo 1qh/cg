@@ -13,7 +13,7 @@ case "${1:-run}" in
     ;;
   run)
     : "${GEMINI_API_KEY:?set GEMINI_API_KEY}"
-    [ "${INJECT_GROUNDING:-}" = "1" ] && export GROUNDING=1 || true
+    [[ "${INJECT_GROUNDING:-}" == "1" ]] && export GROUNDING=1 || true
     exec env PORT="${PORT}" "${BIN}"
     ;;
   *)
