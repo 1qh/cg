@@ -26,7 +26,7 @@ use axum::{
 };
 use futures::{StreamExt as _, stream::Stream};
 use gemini_rust::{
-    Candidate, Content, ContentBuilder, FinishReason, FunctionCall, FunctionDeclaration,
+    Blob, Candidate, Content, ContentBuilder, FinishReason, FunctionCall, FunctionDeclaration,
     FunctionResponse, Gemini, GenerationStream, Model, Part, Role, ThinkingConfig, ThinkingLevel,
     Tool as GTool, UsageMetadata, tools::ToolConfig,
 };
@@ -150,6 +150,10 @@ struct AppState {
 /// One content part of a codex message.
 #[derive(Deserialize)]
 struct CodexContent {
+    /// An `input_image` value (a `data:` URL string, or `{ url }`); maps to a gemini inline-data
+    /// part.
+    #[serde(default)]
+    image_url: Option<Value>,
     /// Text body of the part.
     #[serde(default)]
     text: Option<String>,
@@ -354,12 +358,40 @@ fn sanitize_schema(value: &mut Value) {
 }
 
 /// Build the gemini contents one message item contributes.
+///
+/// Parse a codex `input_image` value (a `data:<mime>;base64,<data>` URL string, or `{ url }`) into
+/// a gemini inline-data blob; `None` when it is not a base64 data URL.
+fn image_blob(image_url: &Value) -> Option<Blob> {
+    let url = image_url
+        .as_str()
+        .or_else(|| return image_url.get("url").and_then(Value::as_str))?;
+    let rest = url.strip_prefix("data:")?;
+    let (mime, b64) = rest.split_once(";base64,")?;
+    return Some(Blob::new(mime, b64));
+}
+
 fn push_message(contents: &mut Vec<Content>, role: &CodexRole, content: &[CodexContent]) {
-    let txt: String = content
-        .iter()
-        .filter_map(|part| return part.text.clone())
-        .collect::<String>();
-    if txt.is_empty() {
+    let mut parts: Vec<Part> = Vec::new();
+    for item in content {
+        if let Some(text) = &item.text
+            && !text.is_empty()
+        {
+            parts.push(Part::Text {
+                text: text.clone(),
+                thought: None,
+                thought_signature: None,
+            });
+        }
+        if let Some(image_url) = &item.image_url
+            && let Some(inline_data) = image_blob(image_url)
+        {
+            parts.push(Part::InlineData {
+                inline_data,
+                media_resolution: None,
+            });
+        }
+    }
+    if parts.is_empty() {
         return;
     }
     let mapped_role = if *role == CodexRole::Assistant {
@@ -367,7 +399,10 @@ fn push_message(contents: &mut Vec<Content>, role: &CodexRole, content: &[CodexC
     } else {
         Role::User
     };
-    contents.push(Content::text(txt).with_role(mapped_role));
+    contents.push(Content {
+        parts: Some(parts),
+        role: Some(mapped_role),
+    });
 }
 
 /// Push a prior function call (with its replayed thought signature) onto the contents.
