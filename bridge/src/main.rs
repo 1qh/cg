@@ -21,6 +21,7 @@ use async_openai::types::responses::{
 use axum::{
     Json, Router,
     extract::State,
+    http::{HeaderMap, StatusCode},
     response::sse::{Event, Sse},
     routing::{get, post},
 };
@@ -212,6 +213,8 @@ enum CodexToolKind {
 struct AppState {
     /// Gemini API key.
     api_key: String,
+    /// Expected `Bearer` credential; `None` leaves the bridge open (documented localhost toggle).
+    bridge_key: Option<String>,
 }
 /// One content part of a codex message; a faithful tagged mirror of codex's `ContentItem`.
 ///
@@ -1388,12 +1391,24 @@ fn spawn_failed(
 }
 
 /// Codex `/v1/responses` handler: translate to gemini, stream typed responses events.
-async fn responses(
-    State(state): State<AppState>,
-    Json(req): Json<CodexReq>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+/// Whether the request carries the configured `Bearer` credential; open when no key is configured.
+fn authorized(headers: &HeaderMap, bridge_key: Option<&String>) -> bool {
+    let Some(expected) = bridge_key else {
+        return true;
+    };
+    let Some(header) = headers.get("authorization") else {
+        return false;
+    };
+    let Ok(value) = header.to_str() else {
+        return false;
+    };
+    return value == format!("Bearer {expected}");
+}
+
+/// Resolve the model + gemini client, then spawn the streaming task; emit `response.failed` on a
+/// missing model or client-construction failure.
+fn launch_stream(api_key: String, req: &CodexReq, sender: Sender<Result<Event, Infallible>>) {
     let created = now_unix();
-    let (sender, receiver) = channel::<Result<Event, Infallible>>(64);
     let response_id = format!("resp_{}", Uuid::new_v4().simple());
     let Some(model) = req
         .model
@@ -1404,20 +1419,21 @@ async fn responses(
             stderr(),
             "request rejected: no model (no fallback)"
         ));
+        discard(api_key);
         spawn_failed(sender, response_id, String::new(), created);
-        return Sse::new(ReceiverStream::new(receiver));
+        return;
     };
-    let contents = build_contents(&req);
+    let contents = build_contents(req);
     let api_model = if model.starts_with("models/") {
         model.clone()
     } else {
         format!("models/{model}")
     };
-    let Ok(client) = Gemini::with_model(state.api_key, Model::Custom(api_model)) else {
+    let Ok(client) = Gemini::with_model(api_key, Model::Custom(api_model)) else {
         spawn_failed(sender, response_id, model, created);
-        return Sse::new(ReceiverStream::new(receiver));
+        return;
     };
-    let builder = build_request(&client, &req, contents);
+    let builder = build_request(&client, req, contents);
     discard(tokio::spawn(Box::pin(async move {
         let meta = RespMeta {
             created,
@@ -1426,7 +1442,27 @@ async fn responses(
         };
         Box::pin(stream_responses(builder, sender, meta)).await;
     })));
-    return Sse::new(ReceiverStream::new(receiver));
+}
+
+/// Codex `/v1/responses` handler: translate to gemini, stream typed responses events.
+///
+/// # Errors
+/// Returns `401 Unauthorized` when a configured `BRIDGE_KEY` does not match the request `Bearer`.
+async fn responses(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<CodexReq>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+    if !authorized(&headers, state.bridge_key.as_ref()) {
+        discard(writeln!(
+            stderr(),
+            "request rejected: bad bridge credential"
+        ));
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let (sender, receiver) = channel::<Result<Event, Infallible>>(64);
+    launch_stream(state.api_key, &req, sender);
+    return Ok(Sse::new(ReceiverStream::new(receiver)));
 }
 
 /// Entry point: bind the bridge and serve.
@@ -1443,15 +1479,26 @@ async fn main() {
         ));
         return;
     };
+    let bridge_key = var("BRIDGE_KEY").ok().filter(|key| return !key.is_empty());
+    if bridge_key.is_none() {
+        discard(writeln!(
+            stderr(),
+            "BRIDGE_KEY unset: bridge open on loopback (set BRIDGE_KEY to require a Bearer \
+             credential)"
+        ));
+    }
     let app = Router::new()
         .route("/v1/responses", post(responses))
         .route("/health/liveliness", get(async || return "ok"))
-        .with_state(AppState { api_key });
+        .with_state(AppState {
+            api_key,
+            bridge_key,
+        });
     let Ok(port) = var("PORT") else {
         discard(writeln!(stderr(), "PORT env required (no fallback)"));
         return;
     };
-    let Ok(listener) = TcpListener::bind(format!("0.0.0.0:{port}")).await else {
+    let Ok(listener) = TcpListener::bind(format!("127.0.0.1:{port}")).await else {
         discard(writeln!(stderr(), "bind failed on :{port}"));
         return;
     };
