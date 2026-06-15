@@ -33,6 +33,12 @@ for v in InputText InputImage OutputText; do
 done
 grep -qE "^[[:space:]]+image_url:" <<< "${content_item}" || missing="${missing} content-field:image_url"
 grep -qE "^[[:space:]]+text:" <<< "${content_item}" || missing="${missing} content-field:text"
+# (4) every ImageDetail value the bridge maps to a gemini media-resolution must still exist;
+# a new value an unmapped mirror would route to Unknown (model default) instead of the caller's intent.
+image_detail="$(sed -n '/pub enum ImageDetail/,/^}/p' <<< "${models_src}")"
+for v in Auto High Low Original; do
+  grep -qE "^[[:space:]]+${v}," <<< "${image_detail}" || missing="${missing} detail:${v}"
+done
 
 if [[ -n ${missing} ]]; then
   printf 'DRIFT: codex types the bridge mirror no longer matches:%s — update the mirror\n' "${missing}" >&2

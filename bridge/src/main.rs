@@ -26,8 +26,8 @@ use axum::{
 use futures::{StreamExt as _, stream::Stream};
 use gemini_rust::{
     Blob, Candidate, Content, ContentBuilder, FinishReason, FunctionCall, FunctionDeclaration,
-    FunctionResponse, Gemini, GenerationStream, Model, Part, Role, ThinkingConfig, ThinkingLevel,
-    Tool as GTool, UsageMetadata, tools::ToolConfig,
+    FunctionResponse, Gemini, GenerationStream, MediaResolution, MediaResolutionLevel, Model, Part,
+    Role, ThinkingConfig, ThinkingLevel, Tool as GTool, UsageMetadata, tools::ToolConfig,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -173,6 +173,9 @@ struct AppState {
 enum CodexContent {
     /// An image part: a `data:<mime>;base64,<data>` URL; maps to a gemini inline-data part.
     InputImage {
+        /// Caller-requested image resolution; maps to the gemini per-part `media_resolution`.
+        #[serde(default)]
+        detail: Option<CodexImageDetail>,
         /// The image data URL codex emits via `into_data_url()`.
         #[serde(default)]
         image_url: String,
@@ -190,6 +193,25 @@ enum CodexContent {
         text: String,
     },
     /// Any unrecognized content kind.
+    #[serde(other)]
+    Unknown,
+}
+/// Caller-requested image resolution; a faithful mirror of codex's `ImageDetail`.
+///
+/// Maps to gemini's per-part `media_resolution`; an unrecognized value falls to `Unknown` (model
+/// default). Kept faithful to codex by the source drift-check.
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum CodexImageDetail {
+    /// Model-chosen resolution.
+    Auto,
+    /// High resolution (more tokens, higher quality).
+    High,
+    /// Low resolution (fewer tokens, lower quality).
+    Low,
+    /// Original resolution; maps to gemini High.
+    Original,
+    /// Any unrecognized detail value.
     #[serde(other)]
     Unknown,
 }
@@ -404,15 +426,35 @@ fn image_blob(image_url: &str) -> Option<Blob> {
     return Some(Blob::new(mime, b64));
 }
 
+/// Map codex's image `detail` to a gemini per-part media-resolution; `None` keeps the model
+/// default.
+const fn media_resolution(detail: Option<&CodexImageDetail>) -> Option<MediaResolution> {
+    let Some(requested) = detail else {
+        return None;
+    };
+    let level = match *requested {
+        CodexImageDetail::Auto | CodexImageDetail::Unknown => {
+            MediaResolutionLevel::MediaResolutionUnspecified
+        },
+        CodexImageDetail::High | CodexImageDetail::Original => {
+            MediaResolutionLevel::MediaResolutionHigh
+        },
+        CodexImageDetail::Low => MediaResolutionLevel::MediaResolutionLow,
+    };
+    return Some(MediaResolution { level });
+}
+
 /// The gemini part one codex content item contributes (text, inline image, or nothing).
 fn content_part(item: &CodexContent) -> Option<Part> {
     return match item {
-        CodexContent::InputImage { image_url } => image_blob(image_url).map(|inline_data| {
-            return Part::InlineData {
-                inline_data,
-                media_resolution: None,
-            };
-        }),
+        CodexContent::InputImage { detail, image_url } => {
+            image_blob(image_url).map(|inline_data| {
+                return Part::InlineData {
+                    inline_data,
+                    media_resolution: media_resolution(detail.as_ref()),
+                };
+            })
+        },
         CodexContent::InputText { text } | CodexContent::OutputText { text } => {
             if text.is_empty() {
                 None
