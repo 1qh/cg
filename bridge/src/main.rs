@@ -459,25 +459,6 @@ fn to_event(event: &ResponseStreamEvent) -> Event {
     return Event::default().data(data);
 }
 
-/// Recursively strip Gemini-unsupported JSON-schema keywords from tool parameters.
-fn sanitize_schema(value: &mut Value) {
-    match *value {
-        Value::Object(ref mut map) => {
-            discard(map.remove("additionalProperties"));
-            discard(map.remove("$schema"));
-            for child in map.values_mut() {
-                sanitize_schema(child);
-            }
-        },
-        Value::Array(ref mut arr) => {
-            for child in arr.iter_mut() {
-                sanitize_schema(child);
-            }
-        },
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {},
-    }
-}
-
 /// Parse a codex image-content `image_url` (`data:<mime>;base64,<data>`) into a gemini inline-data
 /// blob; `None` when it is not a base64 data URL.
 fn image_blob(image_url: &str) -> Option<Blob> {
@@ -675,13 +656,13 @@ fn function_tool(tool: &CodexTool) -> Option<GTool> {
     if tool.kind != CodexToolKind::Function {
         return None;
     }
-    let mut params = tool
+    let params = tool
         .parameters
         .clone()
         .unwrap_or_else(|| return serde_json::json!({ "type": "object", "properties": {} }));
-    sanitize_schema(&mut params);
     return Some(GTool::new(
-        FunctionDeclaration::new(&tool.name, &tool.description, None).with_parameters_value(params),
+        FunctionDeclaration::new(&tool.name, &tool.description, None)
+            .with_parameters_json_schema_value(params),
     ));
 }
 

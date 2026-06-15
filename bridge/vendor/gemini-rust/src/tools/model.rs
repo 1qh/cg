@@ -302,6 +302,17 @@ impl FunctionDeclaration {
         self
     }
 
+    /// Set the parameters for the function using a raw JSON Schema serde value.
+    ///
+    /// Unlike `with_parameters_value` (the OpenAPI-3.0 subset, which rejects `$ref`/`$defs`/
+    /// `additionalProperties`/`anyOf`), this passes the value through gemini's `parametersJsonSchema`
+    /// field, which accepts a full JSON Schema — so an arbitrary tool/MCP schema is honored verbatim.
+    pub fn with_parameters_json_schema_value(mut self, value: Value) -> Self {
+        self.parameters_json_schema = Some(value);
+        self.parameters = None;
+        self
+    }
+
     /// Set the response schema for the function using a struct that implements `JsonSchema`
     pub fn with_response<Response>(mut self) -> Self
     where
