@@ -1,4 +1,4 @@
-.PHONY: bridge-bootstrap bridge-run verify verify-live harness parity-tiers help
+.PHONY: bridge-bootstrap bridge-run verify verify-live harness parity-tiers catalog catalog-check help
 
 ## bridge-bootstrap: build the pure-Rust bridge binary (cargo release)
 bridge-bootstrap:
@@ -33,3 +33,11 @@ help:
 ## codex-drift: assert the bridge's faithful codex-type mirror still covers codex source (CI drift gate)
 codex-drift:
 	@scripts/codex-mirror-drift-check.sh
+
+## catalog: regenerate the model catalog JSON from the typed source (gen-catalog)
+catalog:
+	@cd bridge && cargo build --release --bin gen-catalog -q && ./target/release/gen-catalog
+
+## catalog-check: fail if the committed catalog is stale vs the typed source (codegen freshness gate)
+catalog-check:
+	@cd bridge && cargo build --release --bin gen-catalog -q && cp gemini-catalog.json /tmp/catalog.bak && ./target/release/gen-catalog >/dev/null && if diff -q /tmp/catalog.bak gemini-catalog.json >/dev/null; then echo ok; else cp /tmp/catalog.bak gemini-catalog.json; echo "catalog stale: run make catalog" >&2; exit 1; fi
