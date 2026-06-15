@@ -21,6 +21,8 @@ jobs:
         run: cargo lintmax check
       - name: codex mirror drift gate
         run: make codex-drift
+      - name: catalog codegen freshness gate
+        run: make catalog-check
       - uses: actions/setup-node@v4
         with:
           node-version: latest
