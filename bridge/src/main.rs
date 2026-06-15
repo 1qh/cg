@@ -555,19 +555,21 @@ fn push_function_call(
 }
 
 /// Push a prior function-call output, keyed back to the call name, onto the contents.
+///
+/// An orphan output (no matching call in this request) is skipped, never sent under a placeholder
+/// name — gemini rejects a `function_response` whose name pairs with no functionCall.
 fn push_function_output(
     contents: &mut Vec<Content>,
     names: &HashMap<String, String>,
     call_id: &str,
     output: &str,
 ) {
-    let name = names
-        .get(call_id)
-        .cloned()
-        .unwrap_or_else(|| return "unknown".into());
+    let Some(name) = names.get(call_id) else {
+        return;
+    };
     contents.push(
         Content::function_response(FunctionResponse::new(
-            name,
+            name.clone(),
             serde_json::json!({ "output": output }),
         ))
         .with_role(Role::User),
