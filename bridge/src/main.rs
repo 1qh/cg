@@ -692,6 +692,7 @@ fn build_request(client: &Gemini, req: &CodexReq, contents: Vec<Content>) -> Con
     }
     builder = builder.with_tool(GTool::google_search());
     builder = builder.with_tool(GTool::url_context());
+    builder = builder.with_tool(GTool::code_execution());
     builder = builder.with_tool_config(ToolConfig {
         function_calling_config: tool_choice_mode(req.tool_choice.as_ref())
             .map(|mode| return FunctionCallingConfig { mode }),
