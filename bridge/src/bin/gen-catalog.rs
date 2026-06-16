@@ -123,6 +123,10 @@ fn discard<T>(_value: T) {}
 fn reasoning_levels() -> Vec<ReasoningLevel> {
     return vec![
         ReasoningLevel {
+            description: "Fastest, lightest reasoning for simple tasks where depth is unneeded",
+            effort: "minimal",
+        },
+        ReasoningLevel {
             description: "Balances speed with some reasoning; useful for straightforward queries \
                           and short explanations",
             effort: "low",

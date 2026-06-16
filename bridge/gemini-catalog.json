@@ -22,6 +22,10 @@
       "supported_in_api": true,
       "supported_reasoning_levels": [
         {
+          "description": "Fastest, lightest reasoning for simple tasks where depth is unneeded",
+          "effort": "minimal"
+        },
+        {
           "description": "Balances speed with some reasoning; useful for straightforward queries and short explanations",
           "effort": "low"
         },
@@ -72,6 +76,10 @@
       "supported_in_api": true,
       "supported_reasoning_levels": [
         {
+          "description": "Fastest, lightest reasoning for simple tasks where depth is unneeded",
+          "effort": "minimal"
+        },
+        {
           "description": "Balances speed with some reasoning; useful for straightforward queries and short explanations",
           "effort": "low"
         },
@@ -121,6 +129,10 @@
       "support_verbosity": true,
       "supported_in_api": true,
       "supported_reasoning_levels": [
+        {
+          "description": "Fastest, lightest reasoning for simple tasks where depth is unneeded",
+          "effort": "minimal"
+        },
         {
           "description": "Balances speed with some reasoning; useful for straightforward queries and short explanations",
           "effort": "low"

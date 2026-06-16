@@ -807,15 +807,19 @@ fn function_tools(tools: &[CodexTool]) -> Vec<GTool> {
         .collect();
 }
 
-/// The gemini thinking config for the request's reasoning effort (thoughts always included).
+/// The gemini thinking config for the request's reasoning effort; thoughts always included.
+///
+/// Absent effort defaults to the catalog's declared `default_reasoning_level` (Medium), never
+/// gemini's own built-in default, so the advertised default and the wire stay consistent.
 fn thinking_config(req: &CodexReq) -> ThinkingConfig {
-    let mut thinking = ThinkingConfig::new().with_thoughts_included(true);
-    if let Some(reasoning) = &req.reasoning
-        && let Some(effort) = &reasoning.effort
-    {
-        thinking = thinking.with_thinking_level(effort_level(effort));
-    }
-    return thinking;
+    let level = req
+        .reasoning
+        .as_ref()
+        .and_then(|reasoning| return reasoning.effort.as_ref())
+        .map_or(ThinkingLevel::Medium, effort_level);
+    return ThinkingConfig::new()
+        .with_thoughts_included(true)
+        .with_thinking_level(level);
 }
 
 /// Build the gemini request builder from the codex request + reconstructed contents.
@@ -1132,8 +1136,7 @@ async fn consume_stream(
             NextChunk::End => return true,
             NextChunk::Stalled => {
                 discard(writeln!(stderr(), "gemini stream stall timeout 120s"));
-                state.seq = state.seq.wrapping_add(1);
-                send_failed(sender, meta, state.seq).await;
+                Box::pin(emit_terminal(sender, state, meta)).await;
                 return false;
             },
         };
