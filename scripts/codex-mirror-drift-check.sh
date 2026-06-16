@@ -25,6 +25,12 @@ response_item="$(sed -n '/pub enum ResponseItem/,/^}/p' <<< "${models_src}")"
 for v in Message Reasoning FunctionCall FunctionCallOutput; do
   grep -qE "^[[:space:]]+${v}[[:space:]]*\{" <<< "${response_item}" || missing="${missing} input:${v}"
 done
+# (2b) the EMIT side: the bridge serializes its output items (via async-openai OutputItem) to these
+# ResponseItem fields; codex SILENTLY DROPS an item whose shape drifts, so a renamed field is a quiet
+# content loss the harness may not catch. Assert each emit-populated field still exists in ResponseItem.
+for f in role content summary encrypted_content name call_id arguments; do
+  grep -qE "^[[:space:]]+${f}:" <<< "${response_item}" || missing="${missing} emit-field:${f}"
+done
 # (3) every ContentItem variant the bridge mirrors must still exist with its load-bearing field;
 # a renamed variant/field silently drops text or images (the class of the image-input regression).
 content_item="$(sed -n '/pub enum ContentItem/,/^}/p' <<< "${models_src}")"

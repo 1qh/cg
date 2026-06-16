@@ -35,7 +35,7 @@ test(`advanced harness: approval accept/decline, parallel tools, abort (${MODEL}
       "-c",`model_providers.gemini.base_url="http://localhost:${PORT}/v1"`,"-c",'model_providers.gemini.wire_api="responses"',
       "-c",'model_providers.gemini.env_key="BRIDGE_KEY"',"-c",'model_reasoning_effort="high"',"-c",`model_catalog_json="${CAT}"`];
     srv = spawn("codex", ["app-server", ...cfg], { env: { ...process.env, BRIDGE_KEY: "sk-spike-local" }, stdio: ["pipe","pipe","ignore"] });
-    let id = 1; const pend = new Map(); let buf = "", done = false, failed = null, shellItems = 0, parallelMax = 0, activeTurn = null;
+    let id = 1; const pend = new Map(); let buf = "", done = false, failed = null, shellItems = 0, activeTurn = null;
     const send = (m, pa) => { const i = id++; srv.stdin.write(JSON.stringify({ method: m, id: i, params: pa }) + "\n"); return new Promise(r => pend.set(i, r)); };
     srv.stdout.on("data", c => { buf += c; let nl; while ((nl = buf.indexOf("\n")) >= 0) { const l = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1); if (!l) continue; let m; try { m = JSON.parse(l) } catch { continue }
       if (m.id != null && (m.result !== undefined || m.error !== undefined) && pend.has(m.id)) { pend.get(m.id)(m.result ?? { __e: m.error }); pend.delete(m.id); continue }
@@ -47,7 +47,6 @@ test(`advanced harness: approval accept/decline, parallel tools, abort (${MODEL}
       if (m.method === "turn/started") activeTurn = m.params?.turn?.id ?? m.params?.turnId ?? m.params?.id;
       const it = m.params?.item; const t = it?.type || "";
       if (t === "command_execution" || /command/i.test(t)) shellItems++;
-      // count concurrent unfinished command items as a parallel signal
       if (m.method === "turn/started") shellItems = 0;
       if (m.method === "turn/completed") done = true; if (m.method === "turn/failed") { failed = JSON.stringify(m.params).slice(0,80); done = true } } });
 
@@ -69,10 +68,12 @@ test(`advanced harness: approval accept/decline, parallel tools, abort (${MODEL}
     await turn(B, "Run a shell command to create a file declined.txt containing NO.");
     ck("approval decline -> command blocked", approvalAsked && !existsSync(join(WS, "declined.txt")));
 
-    // parallel tool calls — ask for several independent commands at once
+    // multiple tool calls in one turn — red-capable for the multi-function-call path (a dropped call -> <2)
+    // (true concurrency is not deterministic on the Gemini path per PRODUCT.md, so we verify the real
+    // guarantee: the bridge delivers >=2 of the requested independent commands as tool items in one turn)
     const C = await thread("never");
     await turn(C, "In ONE turn, run these independent shell commands: echo P1; and separately echo P2; and separately echo P3.");
-    ck("parallel/multiple tool calls", shellItems >= 2, `${shellItems} command items`);
+    ck("multiple tool calls handled in one turn", shellItems >= 2, `${shellItems} command items`);
 
     // abort — start a long sleep, interrupt it, expect it to end fast
     const D = await thread("never");

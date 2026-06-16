@@ -42,15 +42,19 @@ test(`full product surface via AppServerSession (${MODEL})`, { timeout: 200000 }
     const gg = await s.getGoal();
     ck("goals set+get via façade", !g?.__error && JSON.stringify(gg).includes("Ship the widget"));
 
+    const parentTid = s.threadId;
     const fk = await s.fork();
-    ck("fork via façade", !fk?.__error && (JSON.stringify(fk).includes("forkedFrom") || !!fk?.thread?.id));
+    const forkedTid = fk?.thread?.id ?? fk?.threadId;
+    // red-capable: a real fork yields a NEW thread id distinct from the parent (not an echo / same thread)
+    ck("fork via façade creates a distinct thread", !fk?.__error && (JSON.stringify(fk).includes("forkedFrom") || (!!forkedTid && forkedTid !== parentTid)), `forked=${forkedTid} parent=${parentTid}`);
 
     // interrupt: start a long turn, interrupt it, expect it to end promptly
     s.startTurnAsync("Run the shell command: sleep 30. Then say DONE.");
     await new Promise(r => setTimeout(r, 4000));
     const ab = await s.interrupt();
     const t0 = Date.now(); const at = await s.awaitTurn(20000);
-    ck("interrupt via façade", !ab?.__error && (Date.now() - t0) < 20000);
+    // red-capable: the interrupt must cut the turn before its sleep+DONE, so DONE never appears in the result
+    ck("interrupt via façade cuts the turn before DONE", !ab?.__error && (Date.now() - t0) < 20000 && !/DONE/.test(JSON.stringify(at ?? "")), /DONE/.test(JSON.stringify(at ?? "")) ? "completed naturally" : "cut");
 
     const passed = results.filter(r => r.p).length;
     for (const r of results) console.log(`  ${r.p ? "PASS" : "FAIL"} ${r.n}${r.d ? " ("+r.d+")" : ""}`);

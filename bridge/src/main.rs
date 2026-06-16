@@ -464,12 +464,17 @@ fn make_response(
     output: Vec<OutputItem>,
     usage: Option<ResponseUsage>,
 ) -> Response {
+    let completed_at = if matches!(status, Status::InProgress) {
+        None
+    } else {
+        Some(now_unix())
+    };
     return Response {
         background: None,
         billing: None,
         conversation: None,
         created_at: meta.created,
-        completed_at: None,
+        completed_at,
         error: None,
         id: meta.response_id.to_owned(),
         incomplete_details: None,
