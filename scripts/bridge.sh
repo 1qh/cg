@@ -13,6 +13,10 @@ case "${1:-run}" in
     ;;
   run)
     : "${GEMINI_API_KEY:?set GEMINI_API_KEY}"
+    [[ -x ${BIN} ]] || {
+      echo "bridge binary not built (${BIN}); run: ${0} bootstrap" >&2
+      exit 1
+    }
     [[ ${INJECT_GROUNDING:-} == "1" ]] && export GROUNDING=1 || true
     exec env PORT="${PORT}" "${BIN}"
     ;;
