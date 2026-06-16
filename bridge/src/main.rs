@@ -312,6 +312,29 @@ struct CodexReasoning {
     #[serde(default)]
     effort: Option<CodexEffort>,
 }
+/// Codex's response-format control: a JSON-schema for structured output, or plain text.
+///
+/// A faithful mirror of codex's `text.format` tagged union; `name`/`strict` are ignored (gemini
+/// constrains on the schema alone), and any unrecognized format degrades to `Text`.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum CodexTextFormat {
+    /// Structured output constrained to a JSON schema.
+    JsonSchema {
+        /// The full JSON schema the output must conform to.
+        schema: Value,
+    },
+    /// Plain text (or any unrecognized format).
+    #[serde(other)]
+    Text,
+}
+/// Codex's `text` control block carrying the response-format request.
+#[derive(Deserialize)]
+struct CodexText {
+    /// The requested response format; absent leaves gemini's default free-form text.
+    #[serde(default)]
+    format: Option<CodexTextFormat>,
+}
 /// Hand-typed codex `/v1/responses` request shape.
 #[derive(Deserialize)]
 struct CodexReq {
@@ -330,6 +353,9 @@ struct CodexReq {
     /// Reasoning-effort control.
     #[serde(default)]
     reasoning: Option<CodexReasoning>,
+    /// Response-format control; a JSON-schema format constrains gemini's output.
+    #[serde(default)]
+    text: Option<CodexText>,
     /// Caller tool-choice control; maps to the gemini function-calling mode.
     #[serde(default)]
     tool_choice: Option<CodexToolChoice>,
@@ -844,7 +870,27 @@ fn build_request(client: &Gemini, req: &CodexReq, contents: Vec<Content>) -> Con
         include_server_side_tool_invocations: Some(true),
         ..ToolConfig::default()
     });
-    return builder.with_thinking_config(thinking_config(req));
+    builder = builder.with_thinking_config(thinking_config(req));
+    let Some(schema) = response_schema(req) else {
+        return builder;
+    };
+    return builder
+        .with_response_mime_type("application/json")
+        .with_response_json_schema(schema);
+}
+
+/// The JSON schema codex requests for structured output (`text.format` = `json_schema`), if any.
+///
+/// The bridge constrains gemini's output to it via `responseJsonSchema`, so a structured-output
+/// request is honored rather than silently dropped to free-form text.
+fn response_schema(req: &CodexReq) -> Option<Value> {
+    let Some(text) = &req.text else {
+        return None;
+    };
+    let Some(CodexTextFormat::JsonSchema { schema }) = &text.format else {
+        return None;
+    };
+    return Some(schema.clone());
 }
 
 /// Emit the two opening lifecycle events; returns false if the receiver closed.
