@@ -23,6 +23,8 @@ jobs:
         run: make codex-drift
       - name: catalog codegen freshness gate
         run: make catalog-check
+      - name: store migrations freshness gate
+        run: make migrations-check
       - uses: actions/setup-node@v4
         with:
           node-version: latest

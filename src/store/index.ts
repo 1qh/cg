@@ -1,22 +1,14 @@
-// Typed thread/turn persistence over better-sqlite3 via Drizzle. The schema is created from the declared
-// tables; product code never writes raw SQL. Persists across app restart so conversations reopen.
+// Typed thread/turn persistence over better-sqlite3 via Drizzle. The schema is created by APPLYING the
+// drizzle-kit-generated migrations (SSOT = schema.ts); product code never writes raw/hand-written SQL.
+// Persists across app restart so conversations reopen.
 import Database from "better-sqlite3";
 import { drizzle, type BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
+import { migrate } from "drizzle-orm/better-sqlite3/migrator";
 import { eq, asc } from "drizzle-orm";
+import { fileURLToPath } from "node:url";
 import { threads, turns, type NewThread, type NewTurn, type Thread, type Turn } from "./schema.ts";
 
-// DDL mirrors schema.ts; drizzle-kit owns it as a generated migration in production. Inline here so a fresh
-// store (and the verify harness) is self-standing without a migration runner.
-const DDL = `
-CREATE TABLE IF NOT EXISTS threads (
-  id TEXT PRIMARY KEY, title TEXT NOT NULL, model TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'active', seeded_from TEXT,
-  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS turns (
-  id TEXT PRIMARY KEY, thread_id TEXT NOT NULL REFERENCES threads(id),
-  input TEXT NOT NULL, final_response TEXT NOT NULL DEFAULT '',
-  status TEXT NOT NULL, usage_json TEXT, created_at INTEGER NOT NULL);
-`;
+const MIGRATIONS = fileURLToPath(new URL("./migrations", import.meta.url));
 
 export class ThreadStore {
   readonly #db: BetterSQLite3Database;
@@ -27,8 +19,8 @@ export class ThreadStore {
     this.#raw = new Database(path);
     this.#raw.pragma("journal_mode = WAL");
     this.#raw.pragma("foreign_keys = ON");
-    this.#raw.exec(DDL);
     this.#db = drizzle(this.#raw);
+    migrate(this.#db, { migrationsFolder: MIGRATIONS });
   }
 
   createThread(t: NewThread): void { this.#db.insert(threads).values(t).run(); }
@@ -40,6 +32,9 @@ export class ThreadStore {
 
   addTurn(t: NewTurn): void { this.#db.insert(turns).values(t).run(); }
   turnsFor(threadId: string): Turn[] { return this.#db.select().from(turns).where(eq(turns.threadId, threadId)).orderBy(asc(turns.createdAt), asc(turns.id)).all(); }
+
+  /** Run a compound write atomically (e.g. create a thread + its first turn) — all-or-nothing. */
+  transaction<T>(fn: () => T): T { return this.#raw.transaction(fn)(); }
 
   close(): void { this.#raw.close(); }
 }

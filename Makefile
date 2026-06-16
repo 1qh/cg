@@ -1,4 +1,4 @@
-.PHONY: bridge-bootstrap bridge-run verify verify-live harness parity-tiers catalog catalog-check help
+.PHONY: bridge-bootstrap bridge-run verify verify-live harness parity-tiers catalog catalog-check migrations-check help
 
 ## bridge-bootstrap: build the pure-Rust bridge binary (cargo release)
 bridge-bootstrap:
@@ -41,3 +41,7 @@ catalog:
 ## catalog-check: fail if the committed catalog is stale vs the typed source (codegen freshness gate)
 catalog-check:
 	@cd bridge && cargo build --release --bin gen-catalog -q && cp gemini-catalog.json /tmp/catalog.bak && ./target/release/gen-catalog >/dev/null && if diff -q /tmp/catalog.bak gemini-catalog.json >/dev/null; then echo ok; else cp /tmp/catalog.bak gemini-catalog.json; echo "catalog stale: run make catalog" >&2; exit 1; fi
+
+## migrations-check: fail if the store schema changed without a regenerated drizzle migration (codegen freshness)
+migrations-check:
+	@n0=$$(ls src/store/migrations/*.sql 2>/dev/null | wc -l | tr -d " "); node_modules/.bin/drizzle-kit generate >/dev/null 2>&1; n1=$$(ls src/store/migrations/*.sql 2>/dev/null | wc -l | tr -d " "); if [ "$$n0" = "$$n1" ]; then echo ok; else echo "store schema.ts changed without a regenerated migration: run drizzle-kit generate + commit" >&2; exit 1; fi
