@@ -10,7 +10,7 @@ use std::{
 };
 
 use async_openai::types::responses::{
-    AssistantRole, FunctionToolCall, IncompleteDetails, InputTokenDetails, OutputItem,
+    AssistantRole, ErrorObject, FunctionToolCall, IncompleteDetails, InputTokenDetails, OutputItem,
     OutputMessage, OutputMessageContent, OutputStatus, OutputTextContent, OutputTokenDetails,
     ReasoningItem, Response, ResponseCompletedEvent, ResponseCreatedEvent, ResponseFailedEvent,
     ResponseFunctionCallArgumentsDeltaEvent, ResponseFunctionCallArgumentsDoneEvent,
@@ -20,7 +20,7 @@ use async_openai::types::responses::{
 };
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode},
     response::sse::{Event, Sse},
     routing::{get, post},
@@ -1301,10 +1301,11 @@ async fn emit_terminal(
                 response: make_response(meta, Status::Completed, out_items, usage),
             })
         },
-        TerminalOutcome::Failed => ResponseStreamEvent::ResponseFailed(ResponseFailedEvent {
-            sequence_number: state.seq,
-            response: make_response(meta, Status::Failed, out_items, usage),
-        }),
+        TerminalOutcome::Failed => failed_event(
+            state.seq,
+            make_response(meta, Status::Failed, out_items, usage),
+            state.finish.as_ref(),
+        ),
         TerminalOutcome::Incomplete(reason) => {
             let mut resp = make_response(meta, Status::Incomplete, out_items, usage);
             resp.incomplete_details = Some(IncompleteDetails {
@@ -1319,16 +1320,41 @@ async fn emit_terminal(
     discard(sender.send(Ok(to_event(&event))).await);
 }
 
-/// Send a terminal `response.failed` carrying the given sequence number.
+/// A human-readable failure message for a terminal `response.failed`, derived from the gemini
+/// finish reason (or the no-finish case), so codex surfaces a cause rather than an empty error.
+fn failed_message(finish: Option<&FinishReason>) -> String {
+    return finish.map_or_else(
+        || return "gemini stream ended without a finish reason".to_owned(),
+        |reason| return format!("gemini terminated abnormally: {reason:?}"),
+    );
+}
+
+/// Wrap a failed `Response` into a `response.failed` event with a populated error cause so codex
+/// never receives a failed response with an empty error.
+fn failed_event(
+    sequence_number: u64,
+    mut response: Response,
+    finish: Option<&FinishReason>,
+) -> ResponseStreamEvent {
+    response.error = Some(ErrorObject {
+        code: "upstream_failure".to_owned(),
+        message: failed_message(finish),
+    });
+    return ResponseStreamEvent::ResponseFailed(ResponseFailedEvent {
+        sequence_number,
+        response,
+    });
+}
+
+/// Send a terminal `response.failed` carrying the given sequence number and a populated error so
+/// codex surfaces a cause; used for pre-stream rejections (no model, connect failure).
 async fn send_failed(
     sender: &Sender<Result<Event, Infallible>>,
     meta: RespMeta<'_>,
     sequence_number: u64,
 ) {
-    let failed = ResponseStreamEvent::ResponseFailed(ResponseFailedEvent {
-        sequence_number,
-        response: make_response(meta, Status::Failed, vec![], None),
-    });
+    let response = make_response(meta, Status::Failed, vec![], None);
+    let failed = failed_event(sequence_number, response, None);
     discard(sender.send(Ok(to_event(&failed))).await);
 }
 
@@ -1429,7 +1455,8 @@ async fn stream_responses(
     if !emit_open(&sender, &mut state, meta).await {
         return;
     }
-    let Some(stream) = open_gemini_stream(builder, &sender, &mut state, meta).await else {
+    let Some(stream) = Box::pin(open_gemini_stream(builder, &sender, &mut state, meta)).await
+    else {
         return;
     };
     drive_with_deadline(&sender, &mut state, stream, meta).await;
@@ -1560,6 +1587,7 @@ async fn main() {
     let app = Router::new()
         .route("/v1/responses", post(responses))
         .route("/health/liveliness", get(async || return "ok"))
+        .layer(DefaultBodyLimit::max(0x400_0000))
         .with_state(AppState {
             api_key,
             bridge_key,
