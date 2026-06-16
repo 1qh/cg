@@ -79,8 +79,10 @@ export class CodexRuntime {
       // retried with deadline + exponential backoff. This is the product path — turn-completion degrades
       // under burst, so the agent retries rather than surfacing a failure.
       async runResilient(input: string, opts?: ResilienceOptions): Promise<TurnResult> {
-        return runResilient(async () => {
-          const turn = await thread.run(input);
+        return runResilient(async (signal) => {
+          // Thread the per-attempt AbortSignal into the SDK so a timed-out attempt actually CANCELS the
+          // in-flight turn (the policy abandons the attempt; without this the underlying turn would leak).
+          const turn = await thread.run(input, { signal });
           return { items: turn.items, finalResponse: turn.finalResponse, usage: turn.usage, threadId: thread.id ?? null };
         }, opts);
       },
