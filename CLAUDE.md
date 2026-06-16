@@ -9,5 +9,5 @@ machine-readable config + this pointer + `README.md` only.
 - Session start: read every `book` doc, then every `cg-doc` ADR + runbook, then this repo's layout, before any
   task — per `book/CLAUDE.md` and `cg-doc/adr/foundation-bootstrap-order.md`.
 - Single-language rust repo: the whole gate is `make rs-lint` (lintmax-rs) over the bridge crate.
-- The sibling `cg-ts` live verify consumes this repo's built bridge binary via its `CG_DIR` (default `../cg`).
+- The sibling `cg-ts` live verify consumes this repo's built bridge binary via its `CG_DIR` (default: the sibling `cg` repo).
 - Operator-local paths, ports, secret locations, and the GitHub org live in `CLAUDE.local.md` (gitignored).
