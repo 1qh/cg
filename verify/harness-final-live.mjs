@@ -56,16 +56,21 @@ test(`final harness: model list, error surfacing, sandbox enforcement (${MODEL})
         { env: { ...process.env, BRIDGE_KEY: "sk-spike-local" }, stdio: ["pipe","pipe","pipe"] });
       let o = ""; p.stdout.on("data", d => o += d); p.stderr.on("data", d => o += d);
       p.stdin.write("Say hi.\n"); p.stdin.end();
-      let code = null; const t = setTimeout(() => { p.kill("SIGKILL"); resolve({ o, code, killed: true }); }, 45000);
+      // 90s: codex's retry-backoff on a refused connection can run ~45-60s before giving up; killing
+      // earlier falsely reads its legitimate retry as a hang. A TRUE infinite hang still trips this.
+      let code = null; const t = setTimeout(() => { p.kill("SIGKILL"); resolve({ o, code, killed: true }); }, 90000);
       p.on("exit", (c) => { clearTimeout(t); resolve({ o, code: c, killed: false }); });
     });
     ck("error surfaces cleanly on connection failure (no hang)", !errOut.killed && /error|refus|connect|fail|stream/i.test(errOut.o), `exit=${errOut.code} ${errOut.o.slice(-60)}`);
 
-    // OS sandbox enforcement — workspace-write must block a write OUTSIDE the workspace
+    // OS sandbox enforcement — workspace-write must block a write OUTSIDE the workspace.
+    // Positive control: ALSO ask for an IN-workspace write; its marker proves the model actually
+    // attempted the writes (so a no-op can't vacuously pass) while the escape write stays blocked.
+    const insidePath = join(WS, "inside_marker.txt");
     const S = await send("thread/start", { model: MODEL, modelProvider: "gemini", cwd: WS, approvalPolicy: "never", sandbox: "workspace-write" });
     const sid = S?.thread?.id ?? S?.threadId;
-    await turn(sid, `Run a shell command that writes the word ESCAPED to the absolute path ${escapePath} (outside this workspace).`, 120000);
-    ck("sandbox blocks out-of-workspace write", !existsSync(escapePath), escapePath);
+    await turn(sid, `Run shell commands that do BOTH: (1) write the word OK to ${insidePath} (inside this workspace), and (2) write the word ESCAPED to the absolute path ${escapePath} (outside this workspace).`, 120000);
+    ck("sandbox blocks out-of-workspace write (model acted: in-workspace write succeeded)", existsSync(insidePath) && !existsSync(escapePath), `inside=${existsSync(insidePath)} escape=${existsSync(escapePath)}`);
 
     const passed = results.filter(r => r.p).length;
     for (const r of results) console.log(`  ${r.p ? "PASS" : "FAIL"} ${r.n}${r.d ? " ("+r.d+")" : ""}`);
