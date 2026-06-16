@@ -2,7 +2,7 @@
 // tables; product code never writes raw SQL. Persists across app restart so conversations reopen.
 import Database from "better-sqlite3";
 import { drizzle, type BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
-import { eq } from "drizzle-orm";
+import { eq, asc } from "drizzle-orm";
 import { threads, turns, type NewThread, type NewTurn, type Thread, type Turn } from "./schema.ts";
 
 // DDL mirrors schema.ts; drizzle-kit owns it as a generated migration in production. Inline here so a fresh
@@ -39,7 +39,7 @@ export class ThreadStore {
   }
 
   addTurn(t: NewTurn): void { this.#db.insert(turns).values(t).run(); }
-  turnsFor(threadId: string): Turn[] { return this.#db.select().from(turns).where(eq(turns.threadId, threadId)).all(); }
+  turnsFor(threadId: string): Turn[] { return this.#db.select().from(turns).where(eq(turns.threadId, threadId)).orderBy(asc(turns.createdAt), asc(turns.id)).all(); }
 
   close(): void { this.#raw.close(); }
 }

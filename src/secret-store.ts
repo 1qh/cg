@@ -6,13 +6,16 @@ const SERVICE = "codex-byok";
 
 export class SecretStore {
   readonly #service: string;
-  constructor(service: string = SERVICE) { this.#service = service; }
+  constructor(service: string = SERVICE) {
+    if (!service.trim()) throw new Error("SecretStore requires a non-empty keychain service name");
+    this.#service = service;
+  }
 
   #entry(account: string): Entry { return new Entry(this.#service, account); }
 
   /** Store a secret under an account name. Overwrites any existing value. */
   set(account: string, secret: string): void {
-    if (!secret) throw new Error("refusing to store an empty secret");
+    if (!secret.trim()) throw new Error("refusing to store an empty secret");
     this.#entry(account).setPassword(secret);
   }
 

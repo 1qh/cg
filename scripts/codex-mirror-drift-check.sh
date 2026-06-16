@@ -9,15 +9,17 @@ here="$(dirname "${0}")"
 root="$(cd "${here}/.." && pwd)"
 tag="$(cat "${root}/bridge/.codex-pin")"
 base="https://raw.githubusercontent.com/openai/codex/${tag}/codex-rs/protocol/src"
-efforts_src="$(curl -fsSL "${base}/openai_models.rs")"
-models_src="$(curl -fsSL "${base}/models.rs")"
+efforts_src="$(curl -fsSL --max-time 30 "${base}/openai_models.rs")"
+models_src="$(curl -fsSL --max-time 30 "${base}/models.rs")"
 bridge="$(cat "${root}/bridge/src/main.rs")"
 
 missing=""
-# (1) every ReasoningEffort wire value codex defines must be handled by CodexEffort.
-efforts="$(grep -oE '"(none|minimal|low|medium|high|xhigh)"' <<< "${efforts_src}" | tr -d '"' | sort -u)"
+# (1) every ReasoningEffort wire value codex defines must be handled by CodexEffort. Extract the values
+# STRUCTURALLY from codex's FromStr arms ("x" => Ok(Self::...)); the Custom catch-all (unquoted) is
+# excluded, so a NEW codex value enters this set and forces a mirror update (a hardcoded allowlist could not).
+efforts="$(grep -oE '"[a-z]+"[[:space:]]*=>[[:space:]]*Ok\(Self::' <<< "${efforts_src}" | grep -oE '^"[a-z]+"' | tr -d '"' | sort -u)"
 for e in ${efforts}; do
-  grep -qF "\"${e}\"" <<< "${bridge}" || missing="${missing} effort:${e}"
+  grep -qE "\"${e}\"[[:space:]]*=>" <<< "${bridge}" || missing="${missing} effort:${e}"
 done
 # (2) every ResponseItem variant the bridge EXPLICITLY handles must still exist in codex's enum;
 # a rename would silently route it to the catch-all and break the agentic loop (e.g. lost tool output).
@@ -28,8 +30,17 @@ done
 # (2b) the EMIT side: the bridge serializes its output items (via async-openai OutputItem) to these
 # ResponseItem fields; codex SILENTLY DROPS an item whose shape drifts, so a renamed field is a quiet
 # content loss the harness may not catch. Assert each emit-populated field still exists in ResponseItem.
-for f in role content summary encrypted_content name call_id arguments; do
-  grep -qE "^[[:space:]]+${f}:" <<< "${response_item}" || missing="${missing} emit-field:${f}"
+msg_block="$(sed -n '/^[[:space:]]*Message[[:space:]]*{/,/^[[:space:]]*},/p' <<< "${response_item}")"
+for f in role content; do
+  grep -qE "^[[:space:]]+${f}:" <<< "${msg_block}" || missing="${missing} message-field:${f}"
+done
+rsn_block="$(sed -n '/^[[:space:]]*Reasoning[[:space:]]*{/,/^[[:space:]]*},/p' <<< "${response_item}")"
+for f in summary encrypted_content; do
+  grep -qE "^[[:space:]]+${f}:" <<< "${rsn_block}" || missing="${missing} reasoning-field:${f}"
+done
+fc_block="$(sed -n '/^[[:space:]]*FunctionCall[[:space:]]*{/,/^[[:space:]]*},/p' <<< "${response_item}")"
+for f in name call_id arguments; do
+  grep -qE "^[[:space:]]+${f}:" <<< "${fc_block}" || missing="${missing} functioncall-field:${f}"
 done
 # (3) every ContentItem variant the bridge mirrors must still exist with its load-bearing field;
 # a renamed variant/field silently drops text or images (the class of the image-input regression).

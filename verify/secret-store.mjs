@@ -20,6 +20,7 @@ test("round-trips a secret through the OS keychain and deletes it", () => {
 test("refuses to store an empty secret (fail-fast, no silent no-op)", () => {
   const store = new SecretStore("codex-byok-verify");
   assert.throws(() => store.set("x", ""), /empty secret/);
+  assert.throws(() => store.set("x", "   "), /empty secret/, "whitespace-only secret must also be rejected");
 });
 
 test("redact never reveals the full secret", () => {
