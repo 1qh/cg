@@ -15,6 +15,7 @@ use axum as _;
 use futures as _;
 use gemini_rust as _;
 use serde::Serialize;
+use subtle as _;
 use tokio as _;
 use tokio_stream as _;
 use uuid as _;

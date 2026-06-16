@@ -34,6 +34,7 @@ use gemini_rust::{
 };
 use serde::Deserialize;
 use serde_json::Value;
+use subtle::ConstantTimeEq as _;
 use tokio::{
     net::TcpListener,
     sync::mpsc::{Sender, channel},
@@ -389,6 +390,15 @@ enum TerminalOutcome {
     /// A bounded stop; emit `response.incomplete` with this reason.
     Incomplete(&'static str),
 }
+/// The outcome of awaiting the next gemini chunk under the per-chunk stall deadline.
+enum NextChunk {
+    /// A chunk arrived within the window.
+    Chunk(Box<GenerationResponse>),
+    /// The stream ended (or errored, already logged) — drive the remaining stages.
+    End,
+    /// No chunk arrived within the stall window — a mid-flight stall.
+    Stalled,
+}
 /// Mutable accumulator threaded through the gemini stream loop.
 struct StreamState {
     /// Pending function calls (name, arguments).
@@ -597,7 +607,7 @@ fn push_message(contents: &mut Vec<Content>, role: &CodexRole, content: &[CodexC
 /// Push a prior function call (with its replayed thought signature) onto the contents.
 fn push_function_call(
     contents: &mut Vec<Content>,
-    pending_sig: &mut Option<String>,
+    pending_sig: Option<&String>,
     name: &str,
     arguments: &str,
 ) {
@@ -611,38 +621,60 @@ fn push_function_call(
             Value::Null
         },
     };
-    let sig = pending_sig
-        .take()
-        .unwrap_or_else(|| return "skip_thought_signature_validator".into());
+    let sig = pending_sig.map_or_else(
+        || return "skip_thought_signature_validator".to_owned(),
+        Clone::clone,
+    );
     contents.push(
         Content::function_call_with_thought(FunctionCall::new(name, args), sig)
             .with_role(Role::Model),
     );
 }
 
-/// Flatten a function-call output (string or content items) to the text the gemini response
-/// carries.
-fn flatten_output(output: &CodexOutput) -> String {
+/// The text a single function-output item contributes; `None` for a non-text item.
+fn output_item_text(item: &CodexOutputItem) -> Option<String> {
+    return match item {
+        CodexOutputItem::InputText { text } => Some(text.clone()),
+        CodexOutputItem::InputImage { .. } | CodexOutputItem::Unknown => None,
+    };
+}
+
+/// The gemini inline-data part a single function-output item contributes; `None` unless it is a
+/// decodable image — so a tool image result becomes a part the model sees, never raw base64 text.
+fn output_item_image(item: &CodexOutputItem) -> Option<Part> {
+    let CodexOutputItem::InputImage { image_url } = item else {
+        return None;
+    };
+    return image_blob(image_url).map(|inline_data| {
+        return Part::InlineData {
+            inline_data,
+            media_resolution: None,
+        };
+    });
+}
+
+/// Split a function-call output (string or content items) into the flattened text the gemini
+/// `function_response` carries plus any inline-image parts that ride a following user content.
+fn output_parts(output: &CodexOutput) -> (String, Vec<Part>) {
     return match output {
-        CodexOutput::Text(text) => text.clone(),
-        CodexOutput::Items(items) => items
-            .iter()
-            .filter_map(|item| {
-                return match item {
-                    CodexOutputItem::InputText { text } => Some(text.clone()),
-                    CodexOutputItem::InputImage { image_url } => Some(image_url.clone()),
-                    CodexOutputItem::Unknown => None,
-                };
-            })
-            .collect::<Vec<String>>()
-            .join("\n"),
+        CodexOutput::Text(text) => (text.clone(), Vec::new()),
+        CodexOutput::Items(items) => {
+            let text = items
+                .iter()
+                .filter_map(output_item_text)
+                .collect::<Vec<String>>()
+                .join("\n");
+            let images = items.iter().filter_map(output_item_image).collect();
+            (text, images)
+        },
     };
 }
 
 /// Push a prior function-call output, keyed back to the call name, onto the contents.
 ///
 /// An orphan output (no matching call in this request) is skipped, never sent under a placeholder
-/// name — gemini rejects a `function_response` whose name pairs with no functionCall.
+/// name — gemini rejects a `function_response` whose name pairs with no functionCall. Image items
+/// in the output ride a following user content as inline-data parts, never lost to text.
 fn push_function_output(
     contents: &mut Vec<Content>,
     names: &HashMap<String, String>,
@@ -652,13 +684,20 @@ fn push_function_output(
     let Some(name) = names.get(call_id) else {
         return;
     };
+    let (text, images) = output_parts(output);
     contents.push(
         Content::function_response(FunctionResponse::new(
             name.clone(),
-            serde_json::json!({ "output": flatten_output(output) }),
+            serde_json::json!({ "output": text }),
         ))
         .with_role(Role::User),
     );
+    if !images.is_empty() {
+        contents.push(Content {
+            parts: Some(images),
+            role: Some(Role::User),
+        });
+    }
 }
 
 /// Map each function-call `call_id` to its declared name across the input array.
@@ -689,6 +728,7 @@ fn push_input_item(
 ) {
     match item {
         CodexInput::Message { role, content } => {
+            *pending_sig = None;
             push_message(contents, role, content);
         },
         CodexInput::Reasoning { encrypted_content } => {
@@ -697,9 +737,10 @@ fn push_input_item(
         CodexInput::FunctionCall {
             name, arguments, ..
         } => {
-            push_function_call(contents, pending_sig, name, arguments);
+            push_function_call(contents, pending_sig.as_ref(), name, arguments);
         },
         CodexInput::FunctionCallOutput { call_id, output } => {
+            *pending_sig = None;
             push_function_output(contents, names, call_id, output);
         },
         CodexInput::Unknown => {},
@@ -924,6 +965,10 @@ async fn handle_function_call(
     thought_signature: Option<String>,
 ) -> bool {
     if let Some(signature) = thought_signature {
+        if state.rsn_emitted == RsnEmitted::Yes {
+            state.rsn_emitted = RsnEmitted::No;
+            state.reasoning = String::new();
+        }
         state.rsn_sig = signature;
     }
     if !flush_reasoning(sender, state).await {
@@ -1057,25 +1102,45 @@ async fn consume_chunk(
     return true;
 }
 
-/// Consume the gemini stream into the accumulator; returns false if the receiver closed.
+/// Await the next gemini chunk under a per-chunk stall deadline; a stall never false-kills a
+/// healthy long stream the way a single total-drive cap does, and is caught promptly.
+async fn next_chunk(stream: &mut GenerationStream) -> NextChunk {
+    return match timeout(Duration::from_mins(2), Box::pin(stream.next())).await {
+        Ok(Some(Ok(chunk))) => NextChunk::Chunk(Box::new(chunk)),
+        Ok(Some(Err(error))) => {
+            discard(writeln!(stderr(), "gemini stream error: {error}"));
+            NextChunk::End
+        },
+        Ok(None) => NextChunk::End,
+        Err(_elapsed) => NextChunk::Stalled,
+    };
+}
+
+/// Consume the gemini stream into the accumulator under the per-chunk stall deadline.
+///
+/// Emits `response.failed` and returns false on an inter-chunk stall or a closed receiver; returns
+/// true when the stream ends cleanly so the caller drives the remaining emit stages.
 async fn consume_stream(
     sender: &Sender<Result<Event, Infallible>>,
     state: &mut StreamState,
+    meta: RespMeta<'_>,
     mut stream: GenerationStream,
 ) -> bool {
-    while let Some(item) = stream.next().await {
-        let chunk = match item {
-            Ok(chunk) => chunk,
-            Err(error) => {
-                discard(writeln!(stderr(), "gemini stream error: {error}"));
-                break;
+    loop {
+        let chunk = match next_chunk(&mut stream).await {
+            NextChunk::Chunk(chunk) => chunk,
+            NextChunk::End => return true,
+            NextChunk::Stalled => {
+                discard(writeln!(stderr(), "gemini stream stall timeout 120s"));
+                state.seq = state.seq.wrapping_add(1);
+                send_failed(sender, meta, state.seq).await;
+                return false;
             },
         };
-        if !Box::pin(consume_chunk(sender, state, chunk)).await {
+        if !Box::pin(consume_chunk(sender, state, *chunk)).await {
             return false;
         }
     }
-    return true;
 }
 
 /// Close the open assistant message; returns false if the receiver closed.
@@ -1283,8 +1348,9 @@ async fn run_stream_stages(
     sender: &Sender<Result<Event, Infallible>>,
     state: &mut StreamState,
     stream: GenerationStream,
+    meta: RespMeta<'_>,
 ) -> bool {
-    return Box::pin(consume_stream(sender, state, stream)).await
+    return Box::pin(consume_stream(sender, state, meta, stream)).await
         && flush_reasoning(sender, state).await
         && close_message(sender, state).await
         && emit_function_calls(sender, state).await;
@@ -1297,7 +1363,7 @@ async fn drive_stream(
     stream: GenerationStream,
     meta: RespMeta<'_>,
 ) {
-    if run_stream_stages(sender, state, stream).await {
+    if Box::pin(run_stream_stages(sender, state, stream, meta)).await {
         emit_terminal(sender, state, meta).await;
     }
 }
@@ -1336,22 +1402,18 @@ async fn open_gemini_stream(
     return Some(stream);
 }
 
-/// Drive the established stream under an overall deadline; emit `response.failed` on a mid-stream
-/// stall.
+/// Drive the established stream to its terminal event.
+///
+/// The per-chunk stall deadline inside `consume_stream` bounds every stream await, so a mid-stream
+/// stall emits `response.failed` without a total-drive cap that would false-kill a healthy long
+/// stream.
 async fn drive_with_deadline(
     sender: &Sender<Result<Event, Infallible>>,
     state: &mut StreamState,
     stream: GenerationStream,
     meta: RespMeta<'_>,
 ) {
-    let drive = timeout(
-        Duration::from_mins(5),
-        Box::pin(drive_stream(sender, state, stream, meta)),
-    );
-    if drive.await.is_err() {
-        state.seq = state.seq.wrapping_add(1);
-        send_failed(sender, meta, state.seq).await;
-    }
+    Box::pin(drive_stream(sender, state, stream, meta)).await;
 }
 
 /// Drive the gemini stream and emit the typed responses event sequence.
@@ -1406,7 +1468,8 @@ fn authorized(headers: &HeaderMap, bridge_key: Option<&String>) -> bool {
     let Ok(value) = header.to_str() else {
         return false;
     };
-    return value == format!("Bearer {expected}");
+    let expected_header = format!("Bearer {expected}");
+    return value.as_bytes().ct_eq(expected_header.as_bytes()).into();
 }
 
 /// Resolve the model + gemini client, then spawn the streaming task; emit `response.failed` on a

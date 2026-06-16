@@ -13,6 +13,7 @@ use futures as _;
 use gemini_rust as _;
 use serde as _;
 use serde_json::{Value, json};
+use subtle as _;
 use tokio::{
     io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines},
     process::{Child, ChildStdin, ChildStdout, Command},
