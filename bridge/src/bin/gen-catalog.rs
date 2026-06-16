@@ -171,7 +171,7 @@ fn model(
         priority: 10,
         shell_type: "shell_command",
         slug,
-        support_verbosity: true,
+        support_verbosity: false,
         supported_in_api: true,
         supported_reasoning_levels: reasoning_levels(),
         supports_image_detail_original: true,
