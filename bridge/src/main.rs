@@ -3,7 +3,7 @@
 //! request/response shapes.
 use core::{convert::Infallible, iter::once, mem::take, time::Duration};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env::var,
     io::{Write as _, stderr},
     time::{SystemTime, UNIX_EPOCH},
@@ -420,8 +420,10 @@ enum TerminalOutcome {
 enum NextChunk {
     /// A chunk arrived within the window.
     Chunk(Box<GenerationResponse>),
-    /// The stream ended (or errored, already logged) — drive the remaining stages.
+    /// The stream ended cleanly — drive the remaining stages.
     End,
+    /// The stream yielded an error — emit `response.failed` carrying its message.
+    Errored(String),
     /// No chunk arrived within the stall window — a mid-flight stall.
     Stalled,
 }
@@ -820,15 +822,22 @@ fn function_tool(tool: &CodexTool) -> Option<GTool> {
     ));
 }
 
-/// Flatten codex's tool list to gemini function tools, descending into `namespace` groups.
+/// Flatten codex's tool list to gemini function tools, descending into `namespace` groups, keeping
+/// the first declaration of each function name.
 ///
 /// codex groups multi-agent / MCP tools under a `namespace` entry whose `tools[]` hold the real
 /// function declarations; a flat scan that only reads top-level `function` tools silently drops
-/// them.
+/// them. The same function name can surface twice (a tool present both top-level and inside a
+/// namespace, or two MCP servers exposing the same name) and gemini rejects the whole request with
+/// `400 Duplicate function declaration` — so dedupe by name, first declaration wins.
 fn function_tools(tools: &[CodexTool]) -> Vec<GTool> {
+    let mut seen: HashSet<String> = HashSet::new();
     return tools
         .iter()
         .flat_map(|tool| return once(tool).chain(tool.tools.iter()))
+        .filter(|tool| {
+            return tool.kind == CodexToolKind::Function && seen.insert(tool.name.clone());
+        })
         .filter_map(function_tool)
         .collect();
 }
@@ -1158,8 +1167,9 @@ async fn next_chunk(stream: &mut GenerationStream) -> NextChunk {
     return match timeout(Duration::from_mins(2), Box::pin(stream.next())).await {
         Ok(Some(Ok(chunk))) => NextChunk::Chunk(Box::new(chunk)),
         Ok(Some(Err(error))) => {
-            discard(writeln!(stderr(), "gemini stream error: {error}"));
-            NextChunk::End
+            let message = format!("gemini stream error: {error}");
+            discard(writeln!(stderr(), "{message}"));
+            NextChunk::Errored(message)
         },
         Ok(None) => NextChunk::End,
         Err(_elapsed) => NextChunk::Stalled,
@@ -1180,6 +1190,11 @@ async fn consume_stream(
         let chunk = match next_chunk(&mut stream).await {
             NextChunk::Chunk(chunk) => chunk,
             NextChunk::End => return true,
+            NextChunk::Errored(message) => {
+                state.seq = state.seq.wrapping_add(1);
+                send_failed(sender, meta, state.seq, message).await;
+                return false;
+            },
             NextChunk::Stalled => {
                 discard(writeln!(stderr(), "gemini stream stall timeout 120s"));
                 Box::pin(emit_terminal(sender, state, meta)).await;
@@ -1398,9 +1413,17 @@ async fn send_failed(
     sender: &Sender<Result<Event, Infallible>>,
     meta: RespMeta<'_>,
     sequence_number: u64,
+    message: String,
 ) {
-    let response = make_response(meta, Status::Failed, vec![], None);
-    let failed = failed_event(sequence_number, response, None);
+    let mut response = make_response(meta, Status::Failed, vec![], None);
+    response.error = Some(ErrorObject {
+        code: "upstream_failure".to_owned(),
+        message,
+    });
+    let failed = ResponseStreamEvent::ResponseFailed(ResponseFailedEvent {
+        sequence_number,
+        response,
+    });
     discard(sender.send(Ok(to_event(&failed))).await);
 }
 
@@ -1449,9 +1472,10 @@ async fn fail_stream(
     sender: &Sender<Result<Event, Infallible>>,
     state: &mut StreamState,
     meta: RespMeta<'_>,
+    message: String,
 ) -> Option<GenerationStream> {
     state.seq = state.seq.wrapping_add(1);
-    send_failed(sender, meta, state.seq).await;
+    send_failed(sender, meta, state.seq, message).await;
     return None;
 }
 
@@ -1466,12 +1490,14 @@ async fn open_gemini_stream(
     let stream = match connect.await {
         Ok(Ok(opened)) => opened,
         Ok(Err(error)) => {
-            discard(writeln!(stderr(), "gemini connect error: {error}"));
-            return fail_stream(sender, state, meta).await;
+            let message = format!("gemini connect error: {error}");
+            discard(writeln!(stderr(), "{message}"));
+            return fail_stream(sender, state, meta, message).await;
         },
         Err(_elapsed) => {
-            discard(writeln!(stderr(), "gemini connect timeout 60s"));
-            return fail_stream(sender, state, meta).await;
+            let message = "gemini connect timeout 60s".to_owned();
+            discard(writeln!(stderr(), "{message}"));
+            return fail_stream(sender, state, meta, message).await;
         },
     };
     return Some(stream);
@@ -1516,6 +1542,9 @@ fn now_unix() -> u64 {
 }
 
 /// Spawn a task emitting a single `response.failed` for a request rejected before streaming starts.
+///
+/// The specific cause is logged to stderr at the call site; codex receives a populated non-empty
+/// error so it never sees an empty failure.
 fn spawn_failed(
     sender: Sender<Result<Event, Infallible>>,
     response_id: String,
@@ -1528,7 +1557,13 @@ fn spawn_failed(
             model: &model,
             response_id: &response_id,
         };
-        send_failed(&sender, meta, 1_u64).await;
+        send_failed(
+            &sender,
+            meta,
+            1_u64,
+            "request rejected before streaming".to_owned(),
+        )
+        .await;
     })));
 }
 
