@@ -15,16 +15,16 @@ jobs:
         include:
           - runner: [self-hosted, macos, arm64]
             target: aarch64-apple-darwin
-            asset: codex-gemini-bridge-darwin-arm64
+            asset: cg-bridge-darwin-arm64
           - runner: [self-hosted, macos, arm64]
             target: x86_64-apple-darwin
-            asset: codex-gemini-bridge-darwin-x64
+            asset: cg-bridge-darwin-x64
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            asset: codex-gemini-bridge-linux-x64
+            asset: cg-bridge-linux-x64
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            asset: codex-gemini-bridge-linux-arm64
+            asset: cg-bridge-linux-arm64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
@@ -34,7 +34,7 @@ jobs:
           tc=$(rustup show active-toolchain | cut -d' ' -f1)
           export PATH="$(rustup show home)/toolchains/$tc/bin:$PATH"
           cargo build --release --manifest-path bridge/Cargo.toml --target ${{ matrix.target }} >/dev/null 2>err || { cat err; exit 1; }
-      - run: cp bridge/target/${{ matrix.target }}/release/codex-gemini-bridge ${{ matrix.asset }}
+      - run: cp bridge/target/${{ matrix.target }}/release/cg-bridge ${{ matrix.asset }}
       - uses: softprops/action-gh-release@v2
         with:
           files: ${{ matrix.asset }}

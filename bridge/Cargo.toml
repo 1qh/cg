@@ -1,5 +1,5 @@
 [package]
-name = "codex-gemini-bridge"
+name = "cg-bridge"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
@@ -7,7 +7,7 @@ publish = false
 description = "Pure-Rust /v1/responses server translating codex's responses API to Gemini"
 
 [[bin]]
-name = "codex-gemini-bridge"
+name = "cg-bridge"
 path = "src/main.rs"
 
 [workspace]
