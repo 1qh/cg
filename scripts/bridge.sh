@@ -4,7 +4,7 @@
 #   run:        scripts/bridge.sh run [PORT]        (launches the bridge binary)
 set -euo pipefail
 D="$(cd "$(dirname "${0}")/.." && pwd)"
-BIN="${D}/bridge/target/release/codex-gemini-bridge"
+BIN="${D}/bridge/target/release/cg-bridge"
 PORT="${2:-4011}"
 case "${1:-run}" in
   bootstrap)
